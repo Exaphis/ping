@@ -7,7 +7,8 @@
  *  References used:
  *    - https://stackoverflow.com/questions/8290046/icmp-sockets-linux
  *    - https://www.geeksforgeeks.org/ping-in-c/
- *    - https://www.cs.utah.edu/~swalton/listings/sockets/programs/part4/chap18/ping.c
+ *    - https://www.cs.utah.edu/~swalton/listings/sockets/programs/part4/
+        chap18/ping.c
  *    - https://beej.us/guide/bgnet/html
  */
 
@@ -106,20 +107,24 @@ bool is_packet_received(int seq) {
  */
 
 bool check_in_cksum(void* buffer, int num_bytes) {
-  unsigned short* data = (unsigned short*)buffer;
-  unsigned short sum = 0;
+  uint16_t* data = (uint16_t*)buffer;
+  uint32_t sum = 0;
 
   while (num_bytes > 1) {
     sum += *data;
+    sum += (sum & (1 << 16)) ? 1 : 0;
+    sum = (uint16_t)sum;
     data++;
-    num_bytes -= 2;
+    num_bytes -= sizeof(unsigned short);
   }
 
   if (num_bytes) {
     sum += *(unsigned char*)data;
+    sum += (sum & (1 << 16)) ? 1 : 0;
+    sum = (uint16_t)sum;
   }
 
-  return sum == (unsigned short)~0;
+  return (unsigned short)(sum + 1) == 0;
 } /* check_in_cksum() */
 
 /*
