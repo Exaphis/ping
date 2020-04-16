@@ -5,10 +5,9 @@
  *  A toy implementation of the ping command in C.
  */
 
-#include "ping.h"
-
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdbool.h>
 #include <string.h>
 #include <netdb.h>
 #include <unistd.h>
@@ -18,6 +17,24 @@
 #include <netinet/ip_icmp.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+
+#define RECV_DATA_MAX_SIZE (2048)
+
+/*
+ *  get_in_addr returns a pointer to the sockaddr_in
+ *  or the sockaddr_in6 depending on the sa_family
+ *  value (AF_INET, AF_INET6) of the input sockaddr.
+ *
+ *  Source: Beej's Guide to Network Programming.
+ */
+
+void* get_in_addr(struct sockaddr* sockaddr) {
+  if (sockaddr->sa_family == AF_INET) {
+    return &(((struct sockaddr_in*)sockaddr)->sin_addr);
+  }
+
+  return &(((struct sockaddr_in6*)sockaddr)->sin6_addr);
+} /* get_in_addr() */
 
 /*
  *  get_dest_addresses uses getaddrinfo to resolve the
@@ -92,6 +109,51 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr, int sequence) {
 } /* send_ping() */
 
 /*
+ *  recv_ping receives an ICMP packet from a given socket
+ *  and prints out the packet's information.
+ *
+ *  The function returns the return value of recvfrom.
+ */
+
+int recv_ping(int socket_fd) {
+  uint8_t data[RECV_DATA_MAX_SIZE];
+  struct sockaddr_storage recv_addr;
+  socklen_t recv_addr_len;
+
+  int bytes_read = recvfrom(socket_fd, data, sizeof(data), 0,
+                            (struct sockaddr*)&recv_addr, &recv_addr_len);
+
+  struct icmphdr* recv_icmp_header = (struct icmphdr*) data;
+
+  if (bytes_read == -1) {
+    perror("recvfrom() failure");
+  }
+  else if (bytes_read < sizeof(recv_icmp_header)) {
+    fprintf(stderr, "Packet length shorter than expected"
+                    "(expected %ld, got %d)\n",
+                    sizeof(recv_icmp_header), bytes_read);
+  }
+  else {
+    if (recv_icmp_header->type != ICMP_ECHOREPLY) {
+      fprintf(stderr, "Packet type different from expected"
+                      "(expected %d, got %d)\n",
+                      ICMP_ECHOREPLY, recv_icmp_header->type);
+    }
+    else {
+      char recv_addr_name[INET6_ADDRSTRLEN];
+      //TODO: record TTL and time
+      printf("%d bytes from %s: icmp_seq=%d\n",
+             bytes_read,
+             inet_ntop(recv_addr.ss_family,
+                       get_in_addr((struct sockaddr*)&recv_addr),
+                       recv_addr_name, sizeof(recv_addr_name)),
+             recv_icmp_header->un.echo.sequence);
+    }
+  }
+  return bytes_read;
+} /* recv_ping() */
+
+/*
  *  Main function for the ping program.
  */
 
@@ -100,6 +162,8 @@ int main(int argc, char** argv) {
     printf("No destination specified.\n");
     return EXIT_FAILURE;
   }
+
+  //TODO: catch ctrl+C, print stats
 
   char* destination = argv[1];
 
@@ -119,6 +183,17 @@ int main(int argc, char** argv) {
     // group to create a socket with IPPROTO_ICMP.
 
     perror("socket creation failure");
+  }
+
+  int num_sent = 0;
+  while (true) {
+    if (send_ping(socket_fd, address, num_sent++) == -1) {
+      return EXIT_FAILURE;
+    }
+
+    if (recv_ping(socket_fd) == -1) {
+      return EXIT_FAILURE;
+    }
   }
 
   close(socket_fd);
