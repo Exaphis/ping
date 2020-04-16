@@ -274,7 +274,9 @@ int recv_ping(int socket_fd) {
              ttl,
              rtt / 1000, rtt % 1000);
 
-      if (!check_in_cksum(data, bytes_read)) {
+      // It seem like the checksum should include the data,
+      // but the checksum sent only includes the header.
+      if (!check_in_cksum(data, sizeof(struct icmphdr))) {
         printf(" - checksum error");
       }
       if (is_duplicate) {
@@ -330,9 +332,11 @@ int main(int argc, char** argv) {
 
     inet_ntop(addr_ptr->ai_family, sin_addr, ip_addr_str, sizeof(ip_addr_str));
 
-    printf("PING %s (%s)\n", destination, ip_addr_str);
+    printf("PING %s (%s)", destination, ip_addr_str);
     break;
   }
+
+  printf(": %d data bytes\n", PING_DATA_SIZE);
 
   if (socket_fd == -1) {
     // A permission denied error occurs when the sysctl parameter
