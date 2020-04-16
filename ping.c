@@ -36,16 +36,27 @@
 static volatile sig_atomic_t g_interrupt = 0;
 static unsigned int g_packets_sent = 0;
 static unsigned int g_packets_received = 0;
-static long min_rtt = LONG_MAX;
-static long max_rtt = 0;
-static unsigned long long rtt_sum = 0;
-static uint8_t g_received_packet[(MAX_ECHO_SEQUENCE / CHAR_BIT) + 1] = { 0 };
+static long g_min_rtt = LONG_MAX;
+static long g_max_rtt = 0;
+static unsigned long long g_rtt_sum = 0;
+uint8_t g_received_packet[(MAX_ECHO_SEQUENCE / CHAR_BIT) + 1] = { 0 };
 
 struct icmp_packet_t {
   struct icmphdr icmp_header;
-  struct timespec sent_time;
-  uint8_t padding[PING_DATA_SIZE - sizeof(struct timespec)];
+  long sent_micros;
+  uint8_t padding[PING_DATA_SIZE - sizeof(long)];
 };
+
+/*
+ *  timesepc_to_micros converts a struct timespec
+ *  (seconds, nanoseconds) representation of time
+ *  to a single long representing the number of
+ *  microseconds since time 0.
+ */
+
+long timespec_to_micros(struct timespec ts) {
+  return (ts.tv_sec * 1000000) + (ts.tv_nsec / 1000);
+} /* timespec_to_micros() */
 
 /*
  *  sigint_handler sets the g_interrupt variable
@@ -98,7 +109,7 @@ bool check_in_cksum(void* buffer, int num_bytes) {
   unsigned short sum = 0;
 
   while (num_bytes > 1) {
-    sum += data[0];
+    sum += *data;
     data++;
     num_bytes -= 2;
   }
@@ -165,9 +176,11 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr) {
   // icmp_header.un.echo.id, checksum, etc. will be automatically set.
   // https://lwn.net/Articles/420800/
 
-  if (clock_gettime(CLOCK_MONOTONIC, &icmp_packet.sent_time) == -1) {
+  struct timespec sent_time = { 0 };
+  if (clock_gettime(CLOCK_MONOTONIC, &sent_time) == -1) {
     perror("clock_gettime() failure");
   }
+  icmp_packet.sent_micros = timespec_to_micros(sent_time);
 
   set_packet_state(icmp_packet.icmp_header.un.echo.sequence, false);
 
@@ -215,15 +228,15 @@ int recv_ping(int socket_fd) {
   if (bytes_read == -1) {
     perror("recvfrom() failure");
   }
-  else if (bytes_read < sizeof(struct icmp_packet_t)) {
-    fprintf(stderr, "Packet length shorter than expected"
-                    "(expected %ld, got %d)\n",
+  else if (bytes_read != sizeof(struct icmp_packet_t)) {
+    fprintf(stderr, "Packet length different than expected"
+                    " (expected %ld, got %d)\n",
                     sizeof(struct icmp_packet_t), bytes_read);
   }
   else {
     if (recv_packet->icmp_header.type != ICMP_ECHOREPLY) {
-      fprintf(stderr, "Packet type different from expected"
-                      "(expected %d, got %d)\n",
+      fprintf(stderr, "Packet type different than expected"
+                      " (expected %d, got %d)\n",
                       ICMP_ECHOREPLY, recv_packet->icmp_header.type);
     }
     else {
@@ -250,18 +263,15 @@ int recv_ping(int socket_fd) {
         fprintf(stderr, "TTL was not found in message control data.\n");
       }
 
-      long sent_micros = (recv_packet->sent_time.tv_sec * 1000000) + \
-                         (recv_packet->sent_time.tv_nsec / 1000);
-      long recv_micros = (recv_time.tv_sec * 1000000) + \
-                         (recv_time.tv_nsec / 1000);
-      long rtt = recv_micros - sent_micros;
+      long recv_micros = timespec_to_micros(recv_time);
+      long rtt = recv_micros - recv_packet->sent_micros;
       assert(rtt >= 0);
 
       if (!is_duplicate) {
         // duplicate packets should not affect min/max/avg rtt
-        min_rtt = rtt < min_rtt ? rtt : min_rtt;
-        max_rtt = rtt > max_rtt ? rtt : max_rtt;
-        rtt_sum += rtt;
+        g_min_rtt = rtt < g_min_rtt ? rtt : g_min_rtt;
+        g_max_rtt = rtt > g_max_rtt ? rtt : g_max_rtt;
+        g_rtt_sum += rtt;
       }
 
       char src_addr_name[INET6_ADDRSTRLEN];
@@ -274,9 +284,7 @@ int recv_ping(int socket_fd) {
              ttl,
              rtt / 1000, rtt % 1000);
 
-      // It seem like the checksum should include the data,
-      // but the checksum sent only includes the header.
-      if (!check_in_cksum(data, sizeof(struct icmphdr))) {
+      if (!check_in_cksum(data, sizeof(bytes_read))) {
         printf(" - checksum error");
       }
       if (is_duplicate) {
@@ -368,11 +376,11 @@ int main(int argc, char** argv) {
          ((float)(g_packets_sent - g_packets_received)) / g_packets_sent);
 
   if (g_packets_received > 0) {
-    unsigned long long avg_rtt = rtt_sum / g_packets_received;
+    unsigned long long g_avg_rtt = g_rtt_sum / g_packets_received;
     printf("round-trip min/avg/max = %ld.%ld/%lld.%lld/%ld.%ld ms\n",
-           min_rtt / 1000, min_rtt % 1000,
-           avg_rtt / 1000, avg_rtt % 1000,
-           max_rtt / 1000, max_rtt % 1000);
+           g_min_rtt / 1000, g_min_rtt % 1000,
+           g_avg_rtt / 1000, g_avg_rtt % 1000,
+           g_max_rtt / 1000, g_max_rtt % 1000);
   }
 
   close(socket_fd);
