@@ -157,9 +157,9 @@ int recv_ping(int socket_fd) {
     else {
       int ttl = -1;
       struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg_header);
-      for (; cmsg != NULL; cmsg = CMSG_NXTHDR(&msg_header, cmsg)) {
-        if (cmsg->cmsg_level == IPPROTO_ICMP && 
-            cmsg->cmsg_type == IP_RECVTTL) {
+      for (; cmsg; cmsg = CMSG_NXTHDR(&msg_header, cmsg)) {
+        if (cmsg->cmsg_level == IPPROTO_IP &&
+            cmsg->cmsg_type == IP_TTL) {
           ttl = *(uint8_t*)CMSG_DATA(cmsg);
           break;
         }
@@ -219,7 +219,7 @@ int main(int argc, char** argv) {
 
   // Set IP_RECVTTL sockopt to be able to parse TTL information
   int yes = 1;
-  setsockopt(socket_fd, IPPROTO_ICMP, IP_RECVTTL, &yes, sizeof(yes));
+  setsockopt(socket_fd, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(yes));
 
   int num_sent = 0;
   while (true) {
