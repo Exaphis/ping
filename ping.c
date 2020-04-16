@@ -26,6 +26,29 @@
 #define RECV_DATA_MAX_SIZE (2048)
 
 /*
+ *  check_in_cksum checks the Internet checksum of
+ *  a given number of bytes of data specified
+ *  by RFC1071.
+ */
+
+bool check_in_cksum(void* buffer, int num_bytes) {
+  unsigned short* data = (unsigned short*)buffer;
+  unsigned short sum = 0;
+
+  while (num_bytes > 1) {
+    sum += data[0];
+    data++;
+    num_bytes -= 2;
+  }
+
+  if (num_bytes) {
+    sum += *(unsigned char*)data;
+  }
+
+  return sum == (unsigned short)~0;
+}
+
+/*
  *  get_in_addr returns a pointer to the sockaddr_in
  *  or the sockaddr_in6 depending on the sa_family
  *  value (AF_INET, AF_INET6) of the input sockaddr.
@@ -172,13 +195,18 @@ int recv_ping(int socket_fd) {
       char src_addr_name[INET6_ADDRSTRLEN];
 
       //TODO: record time
-      printf("%d bytes from %s:  icmp_seq=%d ttl=%d\n",
+      printf("%d bytes from %s: icmp_seq=%d ttl=%d",
              bytes_read,
              inet_ntop(src_addr.ss_family,
                        get_in_addr((struct sockaddr*)&src_addr),
                        src_addr_name, sizeof(src_addr_name)),
              recv_icmp_header->un.echo.sequence,
              ttl);
+
+      if (!check_in_cksum(data, bytes_read)) {
+        printf(" - checksum error");
+      }
+      printf("\n");
     }
   }
   return bytes_read;
