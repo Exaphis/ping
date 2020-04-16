@@ -7,6 +7,7 @@
  *  References used:
  *    - https://stackoverflow.com/questions/8290046/icmp-sockets-linux
  *    - https://www.geeksforgeeks.org/ping-in-c/
+ *    - https://www.cs.utah.edu/~swalton/listings/sockets/programs/part4/chap18/ping.c
  *    - https://beej.us/guide/bgnet/html
  */
 
@@ -284,7 +285,7 @@ int recv_ping(int socket_fd) {
              ttl,
              rtt / 1000, rtt % 1000);
 
-      if (!check_in_cksum(data, sizeof(bytes_read))) {
+      if (!check_in_cksum(data, bytes_read)) {
         printf(" - checksum error");
       }
       if (is_duplicate) {
@@ -340,11 +341,10 @@ int main(int argc, char** argv) {
 
     inet_ntop(addr_ptr->ai_family, sin_addr, ip_addr_str, sizeof(ip_addr_str));
 
-    printf("PING %s (%s)", destination, ip_addr_str);
+    printf("PING %s (%s): %d data bytes\n", destination, ip_addr_str,
+           PING_DATA_SIZE);
     break;
   }
-
-  printf(": %d data bytes\n", PING_DATA_SIZE);
 
   if (socket_fd == -1) {
     // A permission denied error occurs when the sysctl parameter
@@ -353,6 +353,7 @@ int main(int argc, char** argv) {
     perror("socket() failure");
     return EXIT_FAILURE;
   }
+
 
   // Set IP_RECVTTL sockopt to be able to parse TTL information
   int yes = 1;
