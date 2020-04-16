@@ -41,7 +41,7 @@ static unsigned int g_packets_received = 0;
 static long g_min_rtt = LONG_MAX;
 static long g_max_rtt = 0;
 static unsigned long long g_rtt_sum = 0;
-uint8_t g_received_packet[(MAX_ECHO_SEQUENCE / CHAR_BIT) + 1] = { 0 };
+static uint8_t g_received_packet[(MAX_ECHO_SEQUENCE / CHAR_BIT) + 1] = { 0 };
 
 struct icmp_packet_t {
   struct icmphdr icmp_header;
@@ -304,18 +304,63 @@ int recv_ping(int socket_fd) {
 } /* recv_ping() */
 
 /*
+ *  print_help prints instructions for program usage
+ *  to stderr.
+ */
+
+void print_help() {
+  fprintf(stderr, "usage: ping [-6] [-c count] [-t ttl] [-i interval] host\n");
+  fprintf(stderr, "\n");
+  fprintf(stderr, "-6           Use IPv6 instead of IPv4\n");
+  fprintf(stderr, "-c count     Stop after sending count ECHO_REQUEST packets\n");
+  fprintf(stderr, "-t ttl       Set the IP Time to Live\n");
+  fprintf(stderr, "-i interval  Wait <interval> seconds between sending each packet.\n");
+} /* print_help() */
+
+/*
  *  Main function for the ping program.
  */
 
 int main(int argc, char** argv) {
   signal(SIGINT, sigint_handler);
 
-  if (argc < 2) {
-    printf("No destination specified.\n");
+  bool use_ipv6 = false;
+  int custom_ttl = -1;
+  float sleep_duration = 1;
+  int ping_count = -1;
+
+  char c = '\0';
+  while ((c = getopt(argc, argv, "6t:c:i:")) != -1) {
+    switch(c) {
+    case '6':
+      use_ipv6 = true;
+      break;
+    case 't':
+      custom_ttl = atoi(optarg);
+      break;
+    case 'i':
+      sleep_duration = atof(optarg);
+      break;
+    case 'c':
+      ping_count = atoi(optarg);
+      break;
+    case '?':
+      if ((optopt == 't') || (optopt == 'i') || (optopt == 'c')) {
+        fprintf(stderr, "Option -%c requires an argument.\n", optopt);
+        break;
+      }
+    default:
+      print_help();
+      return EXIT_FAILURE;
+    }
+  }
+
+  if (optind != argc - 1) {
+    print_help();
     return EXIT_FAILURE;
   }
 
-  char* destination = argv[1];
+  char* destination = argv[optind];
 
   struct addrinfo* address = get_dest_addresses(destination);
   if (!address) {
@@ -323,28 +368,33 @@ int main(int argc, char** argv) {
   }
 
   // Walk addrinfo linked list until one connects
-  // TODO: IPv4/IPv6 selector
   char ip_addr_str[INET6_ADDRSTRLEN];
   int socket_fd = -1;
   for (struct addrinfo* addr_ptr = address; addr_ptr != NULL;
        addr_ptr = addr_ptr->ai_next) {
-    socket_fd = socket(addr_ptr->ai_family, SOCK_DGRAM, IPPROTO_ICMP);
-    if (socket_fd == -1) {
-      continue;
-    }
-
     void* sin_addr = NULL;
 
     if (addr_ptr->ai_family == AF_INET) {
+      if (use_ipv6) {
+        continue;
+      }
       struct sockaddr_in* ipv4 = (struct sockaddr_in*)addr_ptr->ai_addr;
       sin_addr = &ipv4->sin_addr;
     }
     else {
+      if (!use_ipv6) {
+        continue;
+      }
       struct sockaddr_in6* ipv6 = (struct sockaddr_in6*)addr_ptr->ai_addr;
       sin_addr = &ipv6->sin6_addr;
     }
 
     inet_ntop(addr_ptr->ai_family, sin_addr, ip_addr_str, sizeof(ip_addr_str));
+
+    socket_fd = socket(addr_ptr->ai_family, SOCK_DGRAM, IPPROTO_ICMP);
+    if (socket_fd == -1) {
+      continue;
+    }
 
     printf("PING %s (%s): %d data bytes\n", destination, ip_addr_str,
            PING_DATA_SIZE);
@@ -355,16 +405,25 @@ int main(int argc, char** argv) {
     // A permission denied error occurs when the sysctl parameter
     // net.ipv4.ping_group_range does not allow for the current
     // group to create a socket with IPPROTO_ICMP.
+    //
+    // Solution: sudo sysctl -w "net.ipv4.ping_group_range=0 0"
+    // and run program as root, or set ping group range so your
+    // group is within the range.
     perror("socket() failure");
     return EXIT_FAILURE;
   }
-
 
   // Set IP_RECVTTL sockopt to be able to parse TTL information
   int yes = 1;
   setsockopt(socket_fd, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(yes));
 
-  while (!g_interrupt) {
+  if (custom_ttl != -1) {
+    // TODO: report time exceeded
+    setsockopt(socket_fd, IPPROTO_IP, IP_TTL, &custom_ttl, sizeof(custom_ttl));
+  }
+
+  bool infinite_loop = ping_count == -1;
+  for (int i = 0; infinite_loop || (i < ping_count); i++) {
     if (send_ping(socket_fd, address) == -1) {
       return EXIT_FAILURE;
     }
@@ -373,7 +432,7 @@ int main(int argc, char** argv) {
       return EXIT_FAILURE;
     }
 
-    sleep(1);
+    usleep(sleep_duration * 1000000);
   }
 
   printf("\n--- %s ping statistics ---\n", destination);
