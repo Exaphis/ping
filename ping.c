@@ -3,6 +3,11 @@
  *  Kevin Wu, April 13 2020
  *
  *  A toy implementation of the ping command in C.
+ *
+ *  References used:
+ *    - https://stackoverflow.com/questions/8290046/icmp-sockets-linux
+ *    - https://www.geeksforgeeks.org/ping-in-c/
+ *    - https://beej.us/guide/bgnet/html
  */
 
 #include <stdio.h>
@@ -40,7 +45,7 @@ void* get_in_addr(struct sockaddr* sockaddr) {
  *  get_dest_addresses uses getaddrinfo to resolve the
  *  given host name.
  *  It returns get a linked list of struct addrinfo
- *  that will be passed into socket() and sento().
+ *  that will be passed into socket() and sendto().
  */
 
 struct addrinfo* get_dest_addresses(char* destination) {
@@ -102,7 +107,7 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr, int sequence) {
   int bytes_sent = sendto(socket_fd, &icmp_header, sizeof(icmp_header), 0,
                           dest_addr->ai_addr, dest_addr->ai_addrlen);
   if (bytes_sent == -1) {
-    perror("sento() failure");
+    perror("sendto() failure");
   }
 
   return bytes_sent;
@@ -112,17 +117,27 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr, int sequence) {
  *  recv_ping receives an ICMP packet from a given socket
  *  and prints out the packet's information.
  *
- *  The function returns the return value of recvfrom.
+ *  The function returns the number of bytes received.
  */
 
 int recv_ping(int socket_fd) {
+  // Use recvmsg to find TTL
+  // Source: https://stackoverflow.com/a/49308499
+
   uint8_t data[RECV_DATA_MAX_SIZE];
-  struct sockaddr_storage recv_addr;
-  socklen_t recv_addr_len;
+  struct iovec iov[1] = { { data, sizeof(data) } };
+  struct sockaddr_storage src_addr;
+  uint8_t ctrl_data_buffer[CMSG_SPACE(sizeof(uint8_t))];
+  struct msghdr msg_header = {
+    .msg_name = &src_addr,
+    .msg_namelen = sizeof(src_addr),
+    .msg_iov = iov,
+    .msg_iovlen = 1,
+    .msg_control = ctrl_data_buffer,
+    .msg_controllen = sizeof(ctrl_data_buffer)
+  };  // C99 designated initializers
 
-  int bytes_read = recvfrom(socket_fd, data, sizeof(data), 0,
-                            (struct sockaddr*)&recv_addr, &recv_addr_len);
-
+  int bytes_read = recvmsg(socket_fd, &msg_header, 0);
   struct icmphdr* recv_icmp_header = (struct icmphdr*) data;
 
   if (bytes_read == -1) {
@@ -140,14 +155,30 @@ int recv_ping(int socket_fd) {
                       ICMP_ECHOREPLY, recv_icmp_header->type);
     }
     else {
-      char recv_addr_name[INET6_ADDRSTRLEN];
-      //TODO: record TTL and time
-      printf("%d bytes from %s: icmp_seq=%d\n",
+      int ttl = -1;
+      struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg_header);
+      for (; cmsg != NULL; cmsg = CMSG_NXTHDR(&msg_header, cmsg)) {
+        if (cmsg->cmsg_level == IPPROTO_ICMP && 
+            cmsg->cmsg_type == IP_RECVTTL) {
+          ttl = *(uint8_t*)CMSG_DATA(cmsg);
+          break;
+        }
+      }
+
+      if (ttl == -1) {
+        fprintf(stderr, "TTL was not found in message control data.\n");
+      }
+
+      char src_addr_name[INET6_ADDRSTRLEN];
+
+      //TODO: record time
+      printf("%d bytes from %s:  icmp_seq=%d ttl=%d\n",
              bytes_read,
-             inet_ntop(recv_addr.ss_family,
-                       get_in_addr((struct sockaddr*)&recv_addr),
-                       recv_addr_name, sizeof(recv_addr_name)),
-             recv_icmp_header->un.echo.sequence);
+             inet_ntop(src_addr.ss_family,
+                       get_in_addr((struct sockaddr*)&src_addr),
+                       src_addr_name, sizeof(src_addr_name)),
+             recv_icmp_header->un.echo.sequence,
+             ttl);
     }
   }
   return bytes_read;
@@ -183,7 +214,12 @@ int main(int argc, char** argv) {
     // group to create a socket with IPPROTO_ICMP.
 
     perror("socket creation failure");
+    return EXIT_FAILURE;
   }
+
+  // Set IP_RECVTTL sockopt to be able to parse TTL information
+  int yes = 1;
+  setsockopt(socket_fd, IPPROTO_ICMP, IP_RECVTTL, &yes, sizeof(yes));
 
   int num_sent = 0;
   while (true) {
@@ -194,6 +230,8 @@ int main(int argc, char** argv) {
     if (recv_ping(socket_fd) == -1) {
       return EXIT_FAILURE;
     }
+
+    sleep(1);
   }
 
   close(socket_fd);
