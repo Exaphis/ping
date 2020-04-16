@@ -10,11 +10,14 @@
  *    - https://beej.us/guide/bgnet/html
  */
 
+#include <assert.h>
+#include <limits.h>
+#include <netdb.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
-#include <netdb.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -23,7 +26,55 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 
+// Source: https://stackoverflow.com/a/12762101
+#define MAX_ECHO_SEQUENCE (((unsigned long long)1 << \
+        (sizeof(((struct icmphdr*)0)->un.echo.sequence) * CHAR_BIT)) - 1)
 #define RECV_DATA_MAX_SIZE (2048)
+
+volatile sig_atomic_t g_interrupt = 0;
+unsigned int g_packets_sent = 0;
+unsigned int g_packets_received = 0;
+uint8_t g_received_packet[(MAX_ECHO_SEQUENCE / CHAR_BIT) + 1] = { 0 };
+
+/*
+ *  sigint_handler sets the g_interrupt variable
+ *  when the program is interrupted.
+ */
+
+void sigint_handler(int sig) {
+  g_interrupt = 1;
+} /* sigint_handler() */
+
+/*
+ *  set_packet_state sets the bit in the g_received_packet
+ *  bitmap according to the given state.
+ */
+
+void set_packet_state(int seq, bool state) {
+  assert(seq < MAX_ECHO_SEQUENCE);
+  int idx = seq / CHAR_BIT;
+  int bit = seq % CHAR_BIT;
+
+  if (state) {
+    g_received_packet[idx] |= (1 << bit);
+  }
+  else {
+    g_received_packet[idx] &= ~(1 << bit);
+  }
+} /* set_packet_state() */
+
+/*
+ *  is_packet_received returns whether or not the packet
+ *  was previously received.
+ */
+
+bool is_packet_received(int seq) {
+  assert(seq < MAX_ECHO_SEQUENCE);
+  int idx = seq / CHAR_BIT;
+  int bit = seq % CHAR_BIT;
+
+  return (g_received_packet[idx] & (1 << bit)) != 0;
+} /* is_packet_received() */
 
 /*
  *  check_in_cksum checks the Internet checksum of
@@ -85,31 +136,6 @@ struct addrinfo* get_dest_addresses(char* destination) {
     fprintf(stderr, "getaddrinfo() failure: %s\n", gai_strerror(status));
     return NULL;
   }
-
-  char ip_addr_str[INET6_ADDRSTRLEN];
-  printf("Destination information for %s:\n", destination);
-
-  for (struct addrinfo* addr_ptr = address; addr_ptr != NULL;
-       addr_ptr = addr_ptr->ai_next) {
-    char* ip_ver = NULL;
-    void* sin_addr = NULL;
-
-    if (addr_ptr->ai_family == AF_INET) {
-      ip_ver = "IPv4";
-      struct sockaddr_in* ipv4 = (struct sockaddr_in*)addr_ptr->ai_addr;
-      sin_addr = &ipv4->sin_addr;
-    }
-    else {
-      ip_ver = "IPv6";
-      struct sockaddr_in6* ipv6 = (struct sockaddr_in6*)addr_ptr->ai_addr;
-      sin_addr = &ipv6->sin6_addr;
-    }
-
-    inet_ntop(addr_ptr->ai_family, sin_addr, ip_addr_str, sizeof(ip_addr_str));
-
-    printf("  %s: %s\n", ip_ver, ip_addr_str);
-  }
-
   return address;
 } /* get_dest_addresses() */
 
@@ -120,12 +146,14 @@ struct addrinfo* get_dest_addresses(char* destination) {
  *  The function returns the return value of sendto.
  */
 
-int send_ping(int socket_fd, struct addrinfo* dest_addr, int sequence) {
+int send_ping(int socket_fd, struct addrinfo* dest_addr) {
   struct icmphdr icmp_header = { 0 };
   icmp_header.type = ICMP_ECHO;
-  icmp_header.un.echo.sequence = sequence;
-  // icmp_header.un.echo.id will automatically set.
+  icmp_header.un.echo.sequence = g_packets_sent++;
+  // icmp_header.un.echo.id, checksum, etc. will automatically set.
   // https://lwn.net/Articles/420800/
+
+  set_packet_state(icmp_header.un.echo.sequence, false);
 
   int bytes_sent = sendto(socket_fd, &icmp_header, sizeof(icmp_header), 0,
                           dest_addr->ai_addr, dest_addr->ai_addrlen);
@@ -206,6 +234,15 @@ int recv_ping(int socket_fd) {
       if (!check_in_cksum(data, bytes_read)) {
         printf(" - checksum error");
       }
+
+      if (is_packet_received(recv_icmp_header->un.echo.sequence)) {
+        printf(" - duplicate packet");
+      }
+      else {
+        set_packet_state(recv_icmp_header->un.echo.sequence, false);
+        g_packets_received++;
+      }
+
       printf("\n");
     }
   }
@@ -217,12 +254,12 @@ int recv_ping(int socket_fd) {
  */
 
 int main(int argc, char** argv) {
+  signal(SIGINT, sigint_handler);
+
   if (argc < 2) {
     printf("No destination specified.\n");
     return EXIT_FAILURE;
   }
-
-  //TODO: catch ctrl+C, print stats
 
   char* destination = argv[1];
 
@@ -231,17 +268,38 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  // Assume first entry is valid in addrinfo linked list.
-  // TODO: walk entire list
-  // TODO: IPv4/IPv6 selector?
+  // Walk addrinfo linked list until one connects
+  // TODO: IPv4/IPv6 selector
+  char ip_addr_str[INET6_ADDRSTRLEN];
+  int socket_fd = -1;
+  for (struct addrinfo* addr_ptr = address; addr_ptr != NULL;
+       addr_ptr = addr_ptr->ai_next) {
+    socket_fd = socket(addr_ptr->ai_family, SOCK_DGRAM, IPPROTO_ICMP);
+    if (socket_fd == -1) {
+      continue;
+    }
 
-  int socket_fd = socket(address->ai_family, SOCK_DGRAM, IPPROTO_ICMP);
+    void* sin_addr = NULL;
+
+    if (addr_ptr->ai_family == AF_INET) {
+      struct sockaddr_in* ipv4 = (struct sockaddr_in*)addr_ptr->ai_addr;
+      sin_addr = &ipv4->sin_addr;
+    }
+    else {
+      struct sockaddr_in6* ipv6 = (struct sockaddr_in6*)addr_ptr->ai_addr;
+      sin_addr = &ipv6->sin6_addr;
+    }
+
+    inet_ntop(addr_ptr->ai_family, sin_addr, ip_addr_str, sizeof(ip_addr_str));
+
+    printf("PING %s (%s)\n", destination, ip_addr_str);
+  }
+
   if (socket_fd == -1) {
     // A permission denied error occurs when the sysctl parameter
     // net.ipv4.ping_group_range does not allow for the current
     // group to create a socket with IPPROTO_ICMP.
-
-    perror("socket creation failure");
+    perror("socket() failure");
     return EXIT_FAILURE;
   }
 
@@ -249,9 +307,8 @@ int main(int argc, char** argv) {
   int yes = 1;
   setsockopt(socket_fd, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(yes));
 
-  int num_sent = 0;
-  while (true) {
-    if (send_ping(socket_fd, address, num_sent++) == -1) {
+  while (!g_interrupt) {
+    if (send_ping(socket_fd, address) == -1) {
       return EXIT_FAILURE;
     }
 
@@ -261,6 +318,11 @@ int main(int argc, char** argv) {
 
     sleep(1);
   }
+
+  printf("--- %s ping statistics ---\n", destination);
+  printf("%d packets transmitted, %d packets received, %.1f packet loss",
+         g_packets_sent, g_packets_received,
+         ((float)(g_packets_sent - g_packets_received)) / g_packets_sent);
 
   close(socket_fd);
   freeaddrinfo(address);
