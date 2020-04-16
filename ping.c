@@ -18,6 +18,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <arpa/inet.h>
@@ -30,11 +31,21 @@
 #define MAX_ECHO_SEQUENCE (((unsigned long long)1 << \
         (sizeof(((struct icmphdr*)0)->un.echo.sequence) * CHAR_BIT)) - 1)
 #define RECV_DATA_MAX_SIZE (2048)
+#define PING_DATA_SIZE (56)
 
-volatile sig_atomic_t g_interrupt = 0;
-unsigned int g_packets_sent = 0;
-unsigned int g_packets_received = 0;
-uint8_t g_received_packet[(MAX_ECHO_SEQUENCE / CHAR_BIT) + 1] = { 0 };
+static volatile sig_atomic_t g_interrupt = 0;
+static unsigned int g_packets_sent = 0;
+static unsigned int g_packets_received = 0;
+static long min_rtt = LONG_MAX;
+static long max_rtt = 0;
+static unsigned long long rtt_sum = 0;
+static uint8_t g_received_packet[(MAX_ECHO_SEQUENCE / CHAR_BIT) + 1] = { 0 };
+
+struct icmp_packet_t {
+  struct icmphdr icmp_header;
+  struct timespec sent_time;
+  uint8_t padding[PING_DATA_SIZE - sizeof(struct timespec)];
+};
 
 /*
  *  sigint_handler sets the g_interrupt variable
@@ -97,7 +108,7 @@ bool check_in_cksum(void* buffer, int num_bytes) {
   }
 
   return sum == (unsigned short)~0;
-}
+} /* check_in_cksum() */
 
 /*
  *  get_in_addr returns a pointer to the sockaddr_in
@@ -147,15 +158,20 @@ struct addrinfo* get_dest_addresses(char* destination) {
  */
 
 int send_ping(int socket_fd, struct addrinfo* dest_addr) {
-  struct icmphdr icmp_header = { 0 };
-  icmp_header.type = ICMP_ECHO;
-  icmp_header.un.echo.sequence = g_packets_sent++;
-  // icmp_header.un.echo.id, checksum, etc. will automatically set.
+  struct icmp_packet_t icmp_packet = { 0 };
+
+  icmp_packet.icmp_header.type = ICMP_ECHO;
+  icmp_packet.icmp_header.un.echo.sequence = g_packets_sent++;
+  // icmp_header.un.echo.id, checksum, etc. will be automatically set.
   // https://lwn.net/Articles/420800/
 
-  set_packet_state(icmp_header.un.echo.sequence, false);
+  if (clock_gettime(CLOCK_MONOTONIC, &icmp_packet.sent_time) == -1) {
+    perror("clock_gettime() failure");
+  }
 
-  int bytes_sent = sendto(socket_fd, &icmp_header, sizeof(icmp_header), 0,
+  set_packet_state(icmp_packet.icmp_header.un.echo.sequence, false);
+
+  int bytes_sent = sendto(socket_fd, &icmp_packet, sizeof(icmp_packet), 0,
                           dest_addr->ai_addr, dest_addr->ai_addrlen);
   if (bytes_sent == -1) {
     perror("sendto() failure");
@@ -177,7 +193,7 @@ int recv_ping(int socket_fd) {
 
   uint8_t data[RECV_DATA_MAX_SIZE];
   struct iovec iov[1] = { { data, sizeof(data) } };
-  struct sockaddr_storage src_addr;
+  struct sockaddr_storage src_addr = { 0 };
   uint8_t ctrl_data_buffer[CMSG_SPACE(sizeof(uint8_t))];
   struct msghdr msg_header = {
     .msg_name = &src_addr,
@@ -188,29 +204,43 @@ int recv_ping(int socket_fd) {
     .msg_controllen = sizeof(ctrl_data_buffer)
   };  // C99 designated initializers
 
+  struct timespec recv_time = { 0 };
   int bytes_read = recvmsg(socket_fd, &msg_header, 0);
-  struct icmphdr* recv_icmp_header = (struct icmphdr*) data;
+  if (clock_gettime(CLOCK_MONOTONIC, &recv_time) == -1) {
+    perror("clock_gettime() failure");
+  }
+
+  struct icmp_packet_t* recv_packet = (struct icmp_packet_t*) data;
 
   if (bytes_read == -1) {
     perror("recvfrom() failure");
   }
-  else if (bytes_read < sizeof(recv_icmp_header)) {
+  else if (bytes_read < sizeof(struct icmp_packet_t)) {
     fprintf(stderr, "Packet length shorter than expected"
                     "(expected %ld, got %d)\n",
-                    sizeof(recv_icmp_header), bytes_read);
+                    sizeof(struct icmp_packet_t), bytes_read);
   }
   else {
-    if (recv_icmp_header->type != ICMP_ECHOREPLY) {
+    if (recv_packet->icmp_header.type != ICMP_ECHOREPLY) {
       fprintf(stderr, "Packet type different from expected"
                       "(expected %d, got %d)\n",
-                      ICMP_ECHOREPLY, recv_icmp_header->type);
+                      ICMP_ECHOREPLY, recv_packet->icmp_header.type);
     }
     else {
+      bool is_duplicate = false;
+      if (is_packet_received(recv_packet->icmp_header.un.echo.sequence)) {
+        is_duplicate = true;
+      }
+      else {
+        set_packet_state(recv_packet->icmp_header.un.echo.sequence, false);
+        g_packets_received++;
+      }
+
       int ttl = -1;
       struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg_header);
       for (; cmsg; cmsg = CMSG_NXTHDR(&msg_header, cmsg)) {
-        if (cmsg->cmsg_level == IPPROTO_IP &&
-            cmsg->cmsg_type == IP_TTL) {
+        if ((cmsg->cmsg_level == IPPROTO_IP) &&
+            (cmsg->cmsg_type == IP_TTL)) {
           ttl = *(uint8_t*)CMSG_DATA(cmsg);
           break;
         }
@@ -220,27 +250,35 @@ int recv_ping(int socket_fd) {
         fprintf(stderr, "TTL was not found in message control data.\n");
       }
 
-      char src_addr_name[INET6_ADDRSTRLEN];
+      long sent_micros = (recv_packet->sent_time.tv_sec * 1000000) + \
+                         (recv_packet->sent_time.tv_nsec / 1000);
+      long recv_micros = (recv_time.tv_sec * 1000000) + \
+                         (recv_time.tv_nsec / 1000);
+      long rtt = recv_micros - sent_micros;
+      assert(rtt >= 0);
 
-      //TODO: record time
-      printf("%d bytes from %s: icmp_seq=%d ttl=%d",
+      if (!is_duplicate) {
+        // duplicate packets should not affect min/max/avg rtt
+        min_rtt = rtt < min_rtt ? rtt : min_rtt;
+        max_rtt = rtt > max_rtt ? rtt : max_rtt;
+        rtt_sum += rtt;
+      }
+
+      char src_addr_name[INET6_ADDRSTRLEN];
+      printf("%d bytes from %s: icmp_seq=%d ttl=%d time=%ld.%ld ms",
              bytes_read,
              inet_ntop(src_addr.ss_family,
                        get_in_addr((struct sockaddr*)&src_addr),
                        src_addr_name, sizeof(src_addr_name)),
-             recv_icmp_header->un.echo.sequence,
-             ttl);
+             recv_packet->icmp_header.un.echo.sequence,
+             ttl,
+             rtt / 1000, rtt % 1000);
 
       if (!check_in_cksum(data, bytes_read)) {
         printf(" - checksum error");
       }
-
-      if (is_packet_received(recv_icmp_header->un.echo.sequence)) {
+      if (is_duplicate) {
         printf(" - duplicate packet");
-      }
-      else {
-        set_packet_state(recv_icmp_header->un.echo.sequence, false);
-        g_packets_received++;
       }
 
       printf("\n");
@@ -293,6 +331,7 @@ int main(int argc, char** argv) {
     inet_ntop(addr_ptr->ai_family, sin_addr, ip_addr_str, sizeof(ip_addr_str));
 
     printf("PING %s (%s)\n", destination, ip_addr_str);
+    break;
   }
 
   if (socket_fd == -1) {
@@ -319,10 +358,18 @@ int main(int argc, char** argv) {
     sleep(1);
   }
 
-  printf("--- %s ping statistics ---\n", destination);
-  printf("%d packets transmitted, %d packets received, %.1f packet loss",
+  printf("\n--- %s ping statistics ---\n", destination);
+  printf("%d packets transmitted, %d packets received, %.1f%% packet loss\n",
          g_packets_sent, g_packets_received,
          ((float)(g_packets_sent - g_packets_received)) / g_packets_sent);
+
+  if (g_packets_received > 0) {
+    unsigned long long avg_rtt = rtt_sum / g_packets_received;
+    printf("round-trip min/avg/max = %ld.%ld/%lld.%lld/%ld.%ld ms\n",
+           min_rtt / 1000, min_rtt % 1000,
+           avg_rtt / 1000, avg_rtt % 1000,
+           max_rtt / 1000, max_rtt % 1000);
+  }
 
   close(socket_fd);
   freeaddrinfo(address);
