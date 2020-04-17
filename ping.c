@@ -369,7 +369,7 @@ int main(int argc, char** argv) {
 
   // Walk addrinfo linked list until one connects
   char ip_addr_str[INET6_ADDRSTRLEN];
-  int socket_fd = -1;
+  int socket_fd = -2;
   for (struct addrinfo* addr_ptr = address; addr_ptr != NULL;
        addr_ptr = addr_ptr->ai_next) {
     void* sin_addr = NULL;
@@ -412,6 +412,10 @@ int main(int argc, char** argv) {
     perror("socket() failure");
     return EXIT_FAILURE;
   }
+  else if (socket_fd == -2){
+    fprintf(stderr, "%s: No valid address found\n", destination);
+    return EXIT_FAILURE;
+  }
 
   // Set IP_RECVTTL sockopt to be able to parse TTL information
   int yes = 1;
@@ -422,14 +426,21 @@ int main(int argc, char** argv) {
     setsockopt(socket_fd, IPPROTO_IP, IP_TTL, &custom_ttl, sizeof(custom_ttl));
   }
 
-  bool infinite_loop = ping_count == -1;
-  for (int i = 0; infinite_loop || (i < ping_count); i++) {
+  while (!g_interrupt) {
     if (send_ping(socket_fd, address) == -1) {
       return EXIT_FAILURE;
     }
 
     if (recv_ping(socket_fd) == -1) {
       return EXIT_FAILURE;
+    }
+
+    if (ping_count != -1) {
+      ping_count--;
+
+      if (ping_count == 0) {
+        break;
+      }
     }
 
     usleep(sleep_duration * 1000000);
