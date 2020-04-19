@@ -13,6 +13,7 @@
  */
 
 #include <assert.h>
+#include <errno.h>
 #include <limits.h>
 #include <netdb.h>
 #include <signal.h>
@@ -281,14 +282,16 @@ int recv_ping(int socket_fd) {
       }
 
       char src_addr_name[INET6_ADDRSTRLEN];
-      printf("%d bytes from %s: icmp_seq=%d ttl=%d time=%ld.%ld ms",
+      printf("%d bytes from %s: icmp_seq=%d ttl=%d time=%ld.%03ld ms,"
+             "loss=%.1f%%\n",
              bytes_read,
              inet_ntop(src_addr.ss_family,
                        get_in_addr((struct sockaddr*)&src_addr),
                        src_addr_name, sizeof(src_addr_name)),
              recv_packet->icmp_header.un.echo.sequence,
              ttl,
-             rtt / 1000, rtt % 1000);
+             rtt / 1000, rtt % 1000,
+             (float)(g_packets_sent - g_packets_received) / g_packets_sent);
 
       if (!check_in_cksum(data, bytes_read)) {
         printf(" - checksum error");
@@ -391,7 +394,8 @@ int main(int argc, char** argv) {
 
     inet_ntop(addr_ptr->ai_family, sin_addr, ip_addr_str, sizeof(ip_addr_str));
 
-    socket_fd = socket(addr_ptr->ai_family, SOCK_DGRAM, IPPROTO_ICMP);
+    socket_fd = socket(addr_ptr->ai_family, SOCK_DGRAM,
+                       use_ipv6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
     if (socket_fd == -1) {
       continue;
     }
@@ -409,21 +413,34 @@ int main(int argc, char** argv) {
     // Solution: sudo sysctl -w "net.ipv4.ping_group_range=0 0"
     // and run program as root, or set ping group range so your
     // group is within the range.
-    perror("socket() failure");
-    return EXIT_FAILURE;
-  }
-  else if (socket_fd == -2){
-    fprintf(stderr, "%s: No valid address found\n", destination);
+    if (!errno) {
+      fprintf(stderr, "%s: No valid address found\n", destination);
+    }
+    else {
+      perror("socket() failure");
+
+      if (errno == EACCES) {
+        fprintf(stderr, "Is net.ipv5.ping_group_range valid?\n");
+      }
+    }
     return EXIT_FAILURE;
   }
 
   // Set IP_RECVTTL sockopt to be able to parse TTL information
+  int status = 0;
   int yes = 1;
-  setsockopt(socket_fd, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(yes));
+  status = setsockopt(socket_fd, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(yes));
+  if (status) {
+    perror("setsockopt() failure");
+  }
 
   if (custom_ttl != -1) {
     // TODO: report time exceeded
-    setsockopt(socket_fd, IPPROTO_IP, IP_TTL, &custom_ttl, sizeof(custom_ttl));
+    status = setsockopt(socket_fd, IPPROTO_IP, IP_TTL,
+                        &custom_ttl, sizeof(custom_ttl));
+    if (status) {
+      perror("setsockopt() failure");
+    }
   }
 
   while (!g_interrupt) {
@@ -453,7 +470,7 @@ int main(int argc, char** argv) {
 
   if (g_packets_received > 0) {
     unsigned long long g_avg_rtt = g_rtt_sum / g_packets_received;
-    printf("round-trip min/avg/max = %ld.%ld/%lld.%lld/%ld.%ld ms\n",
+    printf("round-trip min/avg/max = %ld.%03ld/%lld.%03lld/%ld.%03ld ms\n",
            g_min_rtt / 1000, g_min_rtt % 1000,
            g_avg_rtt / 1000, g_avg_rtt % 1000,
            g_max_rtt / 1000, g_max_rtt % 1000);
