@@ -50,6 +50,11 @@ struct icmp_packet_t {
   uint8_t padding[PING_DATA_SIZE - sizeof(long)];
 };
 
+struct recv_icmp_packet_t {
+  struct iphdr ip_header;
+  struct icmp_packet_t icmp_packet;
+};
+
 /*
  *  timesepc_to_micros converts a struct timespec
  *  (seconds, nanoseconds) representation of time
@@ -100,6 +105,36 @@ bool is_packet_received(int seq) {
 
   return (g_received_packet[idx] & (1 << bit)) != 0;
 } /* is_packet_received() */
+
+/*
+ *  gen_in_cksum generates an Internet checksum of
+ *  a given number of bytes of data specified
+ *  by RFC1071.
+ *
+ *  The checksum field must be cleared before
+ *  computing it.
+ */
+
+uint16_t gen_in_cksum(void* buffer, int num_bytes) {
+  uint16_t* data = (uint16_t*)buffer;
+  uint32_t sum = 0;
+
+  while (num_bytes > 1) {
+    sum += *data;
+    sum += (sum & (1 << 16)) ? 1 : 0;
+    sum = (uint16_t)sum;
+    data++;
+    num_bytes -= sizeof(unsigned short);
+  }
+
+  if (num_bytes) {
+    sum += *(unsigned char*)data;
+    sum += (sum & (1 << 16)) ? 1 : 0;
+    sum = (uint16_t)sum;
+  }
+
+  return ~((uint16_t)sum);
+} /* gen_in_cksum() */
 
 /*
  *  check_in_cksum checks the Internet checksum of
@@ -154,10 +189,9 @@ void* get_in_addr(struct sockaddr* sockaddr) {
 struct addrinfo* get_dest_addresses(char* destination) {
   struct addrinfo hints = { 0 };
 
-  // why DGRAM? https://echorand.me/posts/my-own-ping
-  // opening the socket with SOCK_DGRAM instead of SOCK_RAW
-  // avoids using the CAP_NET_RAW capability.
-  hints.ai_socktype = SOCK_DGRAM;
+  // Use SOCK_RAW for access to IP header information (ex. TTL).
+  // To use SOCK_DGRAM, you must set net.ipv4.ping_group_range.
+  hints.ai_socktype = SOCK_RAW;
 
   struct addrinfo* address = NULL;
   int status = getaddrinfo(destination, NULL, &hints, &address);
@@ -180,8 +214,11 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr) {
 
   icmp_packet.icmp_header.type = ICMP_ECHO;
   icmp_packet.icmp_header.un.echo.sequence = g_packets_sent++;
-  // icmp_header.un.echo.id, checksum, etc. will be automatically set.
-  // https://lwn.net/Articles/420800/
+  icmp_packet.icmp_header.un.echo.id = getpid();
+
+  icmp_packet.icmp_header.checksum = 0;
+  uint16_t checksum = gen_in_cksum(&icmp_packet, sizeof(icmp_packet));
+  icmp_packet.icmp_header.checksum = checksum;
 
   struct timespec sent_time = { 0 };
   if (clock_gettime(CLOCK_MONOTONIC, &sent_time) == -1) {
@@ -208,29 +245,20 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr) {
  */
 
 int recv_ping(int socket_fd) {
-  // Use recvmsg to find TTL
-  // Source: https://stackoverflow.com/a/49308499
-
   uint8_t data[RECV_DATA_MAX_SIZE];
-  struct iovec iov[1] = { { data, sizeof(data) } };
   struct sockaddr_storage src_addr = { 0 };
-  uint8_t ctrl_data_buffer[CMSG_SPACE(sizeof(uint8_t))];
-  struct msghdr msg_header = {
-    .msg_name = &src_addr,
-    .msg_namelen = sizeof(src_addr),
-    .msg_iov = iov,
-    .msg_iovlen = 1,
-    .msg_control = ctrl_data_buffer,
-    .msg_controllen = sizeof(ctrl_data_buffer)
-  };  // C99 designated initializers
-
+  socklen_t src_addr_len = sizeof(src_addr);
   struct timespec recv_time = { 0 };
-  int bytes_read = recvmsg(socket_fd, &msg_header, 0);
+
+  int bytes_read = recvfrom(socket_fd, data, RECV_DATA_MAX_SIZE, 0,
+                            (struct sockaddr*)&src_addr, &src_addr_len);
+
   if (clock_gettime(CLOCK_MONOTONIC, &recv_time) == -1) {
     perror("clock_gettime() failure");
   }
 
-  struct icmp_packet_t* recv_packet = (struct icmp_packet_t*) data;
+  struct recv_icmp_packet_t* recv_data = (struct recv_icmp_packet_t*)data;
+  struct icmp_packet_t* recv_packet = &(recv_data->icmp_packet);
 
   if (bytes_read == -1) {
     perror("recvfrom() failure");
@@ -256,19 +284,7 @@ int recv_ping(int socket_fd) {
         g_packets_received++;
       }
 
-      int ttl = -1;
-      struct cmsghdr* cmsg = CMSG_FIRSTHDR(&msg_header);
-      for (; cmsg; cmsg = CMSG_NXTHDR(&msg_header, cmsg)) {
-        if ((cmsg->cmsg_level == IPPROTO_IP) &&
-            (cmsg->cmsg_type == IP_TTL)) {
-          ttl = *(uint8_t*)CMSG_DATA(cmsg);
-          break;
-        }
-      }
-
-      if (ttl == -1) {
-        fprintf(stderr, "TTL was not found in message control data.\n");
-      }
+      int ttl = recv_data->ip_header.ttl;
 
       long recv_micros = timespec_to_micros(recv_time);
       long rtt = recv_micros - recv_packet->sent_micros;
@@ -394,7 +410,7 @@ int main(int argc, char** argv) {
 
     inet_ntop(addr_ptr->ai_family, sin_addr, ip_addr_str, sizeof(ip_addr_str));
 
-    socket_fd = socket(addr_ptr->ai_family, SOCK_DGRAM,
+    socket_fd = socket(addr_ptr->ai_family, SOCK_RAW,
                        use_ipv6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
     if (socket_fd == -1) {
       continue;
@@ -406,43 +422,25 @@ int main(int argc, char** argv) {
   }
 
   if (socket_fd == -1) {
-    // A permission denied error occurs when the sysctl parameter
-    // net.ipv4.ping_group_range does not allow for the current
-    // group to create a socket with IPPROTO_ICMP.
-    //
-    // Solution: sudo sysctl -w "net.ipv4.ping_group_range=0 0"
-    // and run program as root, or set ping group range so your
-    // group is within the range.
     if (!errno) {
       fprintf(stderr, "%s: No valid address found\n", destination);
     }
     else {
       perror("socket() failure");
-
-      if (errno == EACCES) {
-        fprintf(stderr, "Is net.ipv5.ping_group_range valid?\n");
-      }
     }
     return EXIT_FAILURE;
   }
 
-  // Set IP_RECVTTL sockopt to be able to parse TTL information
-  int status = 0;
-  int yes = 1;
-  status = setsockopt(socket_fd, IPPROTO_IP, IP_RECVTTL, &yes, sizeof(yes));
-  if (status) {
-    perror("setsockopt() failure");
-  }
-
   if (custom_ttl != -1) {
     // TODO: report time exceeded
-    status = setsockopt(socket_fd, IPPROTO_IP, IP_TTL,
-                        &custom_ttl, sizeof(custom_ttl));
+    int status = setsockopt(socket_fd, IPPROTO_IP, IP_TTL,
+                            &custom_ttl, sizeof(custom_ttl));
     if (status) {
       perror("setsockopt() failure");
     }
   }
 
+  // TODO: allow sending without receiving
   while (!g_interrupt) {
     if (send_ping(socket_fd, address) == -1) {
       return EXIT_FAILURE;
