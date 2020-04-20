@@ -13,6 +13,7 @@
  *    - https://tools.ietf.org/html/rfc792 - Internet Control Message Protocol
  *    - https://tools.ietf.org/html/rfc3542 - Advanced Sockets Application
  *      Program Interface (API) for IPv6
+ *    - https://github.com/octo/liboping/blob/master/src/liboping.c
  */
 
 #include <assert.h>
@@ -85,7 +86,8 @@ void sigint_handler(int sig) {
 
 /*
  *  set_packet_state sets the bit in the g_received_packet
- *  bitmap according to the given state.
+ *  bitmap according to the given state (whether or not packet
+ *  was received).
  */
 
 void set_packet_state(int seq, bool state) {
@@ -197,7 +199,6 @@ void* get_in_addr(struct sockaddr* sockaddr) {
 struct addrinfo* get_dest_addresses(char* destination) {
   struct addrinfo hints = { 0 };
 
-  // Use SOCK_RAW for access to IP header information (ex. TTL).
   // To use SOCK_DGRAM, you must set net.ipv4.ping_group_range.
   hints.ai_socktype = SOCK_RAW;
 
@@ -286,8 +287,8 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr, bool use_ipv6) {
  */
 
 int recv_ping(int socket_fd, bool use_ipv6) {
-  // Setting up for recvmsg
-  // https://stackoverflow.com/a/49308499
+  // Setup for recvmsg (for parsing TTL)
+  // Source: https://stackoverflow.com/a/49308499
 
   uint8_t data[RECV_DATA_MAX_SIZE];
   struct sockaddr_storage src_addr = { 0 };
@@ -334,6 +335,8 @@ int recv_ping(int socket_fd, bool use_ipv6) {
 
   struct iphdr* ip_header = (struct iphdr*)data;
 
+  // IPv6 headers are not included in the socket response,
+  // but IPv4 headers are.
   if (!use_ipv6 && (ip_header->protocol != IPPROTO_ICMP)) {
     fprintf(stderr, "Protocol not ICMP\n");
     printf(" %d\n", ip_header->protocol);
@@ -389,12 +392,6 @@ int recv_ping(int socket_fd, bool use_ipv6) {
     // be set for ICMPv6 sockets.
     checksum_correct = true;
   }
-
-  // debug
-  //printf("type: %d\ncode: %d\nid: %d\nsequence:%d\nttl:%d\n", header_type, header_code, header_id, header_seq, ttl);
-  //printf("micros: %llX\n", sent_micros);
-  //printf("%d\n", is_packet_received(0));
-  // endbug
 
   int icmp_len = bytes_read - ip_header_len;
 
@@ -461,6 +458,7 @@ int recv_ping(int socket_fd, bool use_ipv6) {
       if (!checksum_correct) {
         printf(" - checksum error");
       }
+
       if (is_duplicate) {
         printf(" - duplicate packet");
       }
@@ -670,7 +668,7 @@ int main(int argc, char** argv) {
 
           sent = true;
         }
-        else {  // read should now be open
+        else {  // read must now be available
           assert(FD_ISSET(socket_fd, &read_fds));
           if (recv_ping(socket_fd, opt_use_ipv6) == -1) {
             return EXIT_FAILURE;
