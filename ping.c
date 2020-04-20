@@ -318,11 +318,13 @@ int recv_ping(int socket_fd, bool use_ipv6) {
   for (; cmsg; cmsg = CMSG_NXTHDR(&hdr, cmsg)) {
     if ((cmsg->cmsg_level == IPPROTO_IP) &&
         (cmsg->cmsg_type == IP_TTL)) {
-      ttl = *(uint8_t*)CMSG_DATA(cmsg);
+      memcpy(&ttl, CMSG_DATA(cmsg), sizeof(ttl));
     }
     else if ((cmsg->cmsg_level == IPPROTO_IPV6) &&
              (cmsg->cmsg_type == IPV6_HOPLIMIT)) {
-      ttl = *(uint8_t*)CMSG_DATA(cmsg);
+      // Why does the received hoplimit not change with
+      // the set UNICAST_HOPS?
+      memcpy(&ttl, CMSG_DATA(cmsg), sizeof(ttl));
     }
   }
   if (ttl == -1) {
@@ -413,17 +415,20 @@ int recv_ping(int socket_fd, bool use_ipv6) {
       //                " (expected %d, got %d)\n", ident, header_id);
     }
     else if (header_type != (use_ipv6 ? ICMP6_ECHO_REPLY : ICMP_ECHOREPLY)) {
-      fprintf(stderr, "%d bytes from %s icmp_seq = %d ",
-              bytes_read, src_addr_name,
-              header_seq);
       if (header_type == (use_ipv6 ? ICMP6_TIME_EXCEEDED : ICMP_TIME_EXCEEDED)) {
-        fprintf(stderr, "Time to live exceeded\n");
+        fprintf(stderr, "%d bytes from %s icmp_seq=%d Time to live exceeded\n",
+                bytes_read, src_addr_name,
+                header_seq);
       }
       else {
-        fprintf(stderr, "ICMP header type different than expected"
-                        " (expected %d, got %d)\n",
-                        (use_ipv6 ? ICMP6_ECHO_REPLY : ICMP_ECHOREPLY), header_type);
+        // Can safely ignore (router advertisement, neighbor advertisement,
+        // localhost loops back, etc.)
+        //fprintf(stderr, "ICMP header type different than expected"
+        //                " (expected %d, got %d)\n",
+        //                (use_ipv6 ? ICMP6_ECHO_REPLY : ICMP_ECHOREPLY), header_type);
       }
+
+      // Can also output other error messages here (ICMP_DEST_UNREACH, etc.)
     }
     else {
       bool is_duplicate = false;
