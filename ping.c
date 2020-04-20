@@ -480,7 +480,7 @@ void print_help() {
   fprintf(stderr, "usage: ping [-6] [-c count] [-t ttl] [-i interval] host\n");
   fprintf(stderr, "\n");
   fprintf(stderr, "-6           Use IPv6 instead of IPv4\n");
-  fprintf(stderr, "-c count     Stop after sending count ECHO_REQUEST packets\n");
+  fprintf(stderr, "-c count     Stop after sending <count> packets\n");
   fprintf(stderr, "-t ttl       Set the IP Time to Live\n");
   fprintf(stderr, "-i interval  Wait <interval> seconds between sending each packet\n");
 } /* print_help() */
