@@ -10,6 +10,7 @@
  *    - https://www.cs.utah.edu/~swalton/listings/sockets/programs/part4/
         chap18/ping.c
  *    - https://beej.us/guide/bgnet/html
+ *    - https://tools.ietf.org/html/rfc2292
  */
 
 #include <assert.h>
@@ -27,6 +28,7 @@
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/icmp6.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 
@@ -43,11 +45,16 @@ static long g_min_rtt = LONG_MAX;
 static long g_max_rtt = 0;
 static unsigned long long g_rtt_sum = 0;
 static uint8_t g_received_packet[(MAX_ECHO_SEQUENCE / CHAR_BIT) + 1] = { 0 };
-static bool use_ipv6 = false;
 static int ident = 0;  // Will be set to current PID, used for ICMP identifier
 
 struct icmp_packet_t {
   struct icmphdr icmp_header;
+  long sent_micros;
+  uint8_t padding[PING_DATA_SIZE - sizeof(long)];
+};
+
+struct icmp6_packet_t {
+  struct icmp6_hdr icmp_header;
   long sent_micros;
   uint8_t padding[PING_DATA_SIZE - sizeof(long)];
 };
@@ -206,34 +213,65 @@ struct addrinfo* get_dest_addresses(char* destination) {
  *  The function returns the return value of sendto.
  */
 
-int send_ping(int socket_fd, struct addrinfo* dest_addr) {
-  struct icmp_packet_t icmp_packet = { 0 };
+int send_ping(int socket_fd, struct addrinfo* dest_addr, bool use_ipv6) {
+  if (!use_ipv6) {
+    struct icmp_packet_t icmp_packet = { 0 };
 
-  icmp_packet.icmp_header.type = ICMP_ECHO;
-  icmp_packet.icmp_header.code = 0;
-  icmp_packet.icmp_header.un.echo.sequence = g_packets_sent++;
-  icmp_packet.icmp_header.un.echo.id = ident;
+    icmp_packet.icmp_header.type = ICMP_ECHO;
+    icmp_packet.icmp_header.code = 0;
+    icmp_packet.icmp_header.un.echo.sequence = g_packets_sent++;
+    icmp_packet.icmp_header.un.echo.id = ident;
 
-  struct timespec sent_time = { 0 };
-  if (clock_gettime(CLOCK_MONOTONIC, &sent_time) == -1) {
-    perror("clock_gettime() failure");
+    struct timespec sent_time = { 0 };
+    if (clock_gettime(CLOCK_MONOTONIC, &sent_time) == -1) {
+      perror("clock_gettime() failure");
+    }
+    icmp_packet.sent_micros = timespec_to_micros(sent_time);
+
+    set_packet_state(icmp_packet.icmp_header.un.echo.sequence, false);
+
+    icmp_packet.icmp_header.checksum = 0;
+    uint16_t checksum = gen_in_cksum(&icmp_packet, sizeof(icmp_packet));
+    icmp_packet.icmp_header.checksum = checksum;
+
+    assert(check_in_cksum(&icmp_packet, sizeof(icmp_packet)));
+    int bytes_sent = sendto(socket_fd, &icmp_packet, sizeof(icmp_packet), 0,
+                            dest_addr->ai_addr, dest_addr->ai_addrlen);
+    if ((bytes_sent == -1) || (bytes_sent != sizeof(icmp_packet))) {
+      perror("sendto() failure");
+    }
+
+    return bytes_sent;
   }
-  icmp_packet.sent_micros = timespec_to_micros(sent_time);
+  else {
+    struct icmp6_packet_t icmp_packet = { 0 };
 
-  set_packet_state(icmp_packet.icmp_header.un.echo.sequence, false);
+    icmp_packet.icmp_header.icmp6_type = ICMP6_ECHO_REQUEST;
+    icmp_packet.icmp_header.icmp6_code = 0;
+    icmp_packet.icmp_header.icmp6_seq = g_packets_sent++;
+    icmp_packet.icmp_header.icmp6_id = ident;
 
-  icmp_packet.icmp_header.checksum = 0;
-  uint16_t checksum = gen_in_cksum(&icmp_packet, sizeof(icmp_packet));
-  icmp_packet.icmp_header.checksum = checksum;
+    struct timespec sent_time = { 0 };
+    if (clock_gettime(CLOCK_MONOTONIC, &sent_time) == -1) {
+      perror("clock_gettime() failure");
+    }
+    icmp_packet.sent_micros = timespec_to_micros(sent_time);
 
-  assert(check_in_cksum(&icmp_packet, sizeof(icmp_packet)));
-  int bytes_sent = sendto(socket_fd, &icmp_packet, sizeof(icmp_packet), 0,
-                          dest_addr->ai_addr, dest_addr->ai_addrlen);
-  if ((bytes_sent == -1) || (bytes_sent != sizeof(icmp_packet))) {
-    perror("sendto() failure");
+    set_packet_state(icmp_packet.icmp_header.icmp6_seq, false);
+
+    // Checksums are automatically computed for ICMPv6 packets
+    icmp_packet.icmp_header.icmp6_cksum = 0;
+    uint16_t checksum = gen_in_cksum(&icmp_packet, sizeof(icmp_packet));
+    icmp_packet.icmp_header.icmp6_cksum = checksum;
+
+    int bytes_sent = sendto(socket_fd, &icmp_packet, sizeof(icmp_packet), 0,
+                            dest_addr->ai_addr, dest_addr->ai_addrlen);
+    if ((bytes_sent == -1) || (bytes_sent != sizeof(icmp_packet))) {
+      perror("sendto() failure");
+    }
+
+    return bytes_sent;
   }
-
-  return bytes_sent;
 } /* send_ping() */
 
 /*
@@ -243,17 +281,48 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr) {
  *  The function returns the number of bytes received.
  */
 
-int recv_ping(int socket_fd) {
+int recv_ping(int socket_fd, bool use_ipv6) {
+  // Setting up for recvmsg
+  // https://stackoverflow.com/a/49308499
+
   uint8_t data[RECV_DATA_MAX_SIZE];
   struct sockaddr_storage src_addr = { 0 };
   socklen_t src_addr_len = sizeof(src_addr);
+  struct iovec iov[1] = { { data, sizeof(data) } };
+  uint8_t ctrl_data_buffer[CMSG_SPACE(sizeof(uint8_t))];
+
+  struct msghdr hdr = {
+    .msg_name = &src_addr,
+    .msg_namelen = src_addr_len,
+    .msg_iov = iov,
+    .msg_iovlen = 1,
+    .msg_control = ctrl_data_buffer,
+    .msg_controllen = sizeof(ctrl_data_buffer)
+  };
+
   struct timespec recv_time = { 0 };
 
-  int bytes_read = recvfrom(socket_fd, data, RECV_DATA_MAX_SIZE, 0,
-                            (struct sockaddr*)&src_addr, &src_addr_len);
+  int bytes_read = recvmsg(socket_fd, &hdr, 0);
 
   if (clock_gettime(CLOCK_MONOTONIC, &recv_time) == -1) {
     perror("clock_gettime() failure");
+  }
+
+  // Parse ancillary data for TTL
+  int ttl = -1;
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&hdr);
+  for (; cmsg; cmsg = CMSG_NXTHDR(&hdr, cmsg)) {
+    if ((cmsg->cmsg_level == IPPROTO_IP) &&
+        (cmsg->cmsg_type == IP_TTL)) {
+      ttl = *(uint8_t*)CMSG_DATA(cmsg);
+    }
+    else if ((cmsg->cmsg_level == IPPROTO_IPV6) &&
+             (cmsg->cmsg_type == IPV6_HOPLIMIT)) {
+      ttl = *(uint8_t*)CMSG_DATA(cmsg);
+    }
+  }
+  if (ttl == -1) {
+    fprintf(stderr, "TTL not found in ancillary data\n");
   }
 
   char src_addr_name[INET6_ADDRSTRLEN];
@@ -264,6 +333,7 @@ int recv_ping(int socket_fd) {
 
   if (!use_ipv6 && (ip_header->protocol != IPPROTO_ICMP)) {
     fprintf(stderr, "Protocol not ICMP\n");
+    printf(" %d\n", ip_header->protocol);
     return bytes_read;
   }
 
@@ -273,10 +343,31 @@ int recv_ping(int socket_fd) {
     ip_header_len = ip_header->ihl * sizeof(uint32_t);
   }
 
-  struct icmp_packet_t* recv_packet = (struct icmp_packet_t*)(data + ip_header_len);
+  uint8_t header_type = 0;
+  //uint8_t header_code = 0;
+  uint16_t header_seq = 0;
+  uint16_t header_id = 0;
+  long sent_micros = 0;
+
+  if (!use_ipv6) {
+    struct icmp_packet_t* recv_packet = (struct icmp_packet_t*)(data + ip_header_len);
+    header_type = recv_packet->icmp_header.type;
+    //header_code = recv_packet->icmp_header.code;
+    header_seq = recv_packet->icmp_header.un.echo.sequence;
+    header_id = recv_packet->icmp_header.un.echo.id;
+    sent_micros = recv_packet->sent_micros;
+  }
+  else {
+    struct icmp6_packet_t* recv_packet = (struct icmp6_packet_t*)(data + ip_header_len);
+    header_type = recv_packet->icmp_header.icmp6_type;
+    //header_code = recv_packet->icmp_header.icmp6_code;
+    header_seq = recv_packet->icmp_header.icmp6_seq;
+    header_id = recv_packet->icmp_header.icmp6_id;
+    sent_micros = recv_packet->sent_micros;
+  }
 
   // debug
-  printf("type: %d\ncode: %d\nid: %d\nsequence:%d\n", recv_packet->icmp_header.type, recv_packet->icmp_header.code, recv_packet->icmp_header.un.echo.id, recv_packet->icmp_header.un.echo.sequence);
+  //printf("type: %d\ncode: %d\nid: %d\nsequence:%d\nttl:%d\n", header_type, header_code, header_id, header_seq, ttl);
   // endbug
 
   int icmp_len = bytes_read - ip_header_len;
@@ -284,42 +375,41 @@ int recv_ping(int socket_fd) {
   if (bytes_read == -1) {
     perror("recvfrom() failure");
   }
-  else if (icmp_len < sizeof(struct icmphdr)) {
+  else if (icmp_len < (use_ipv6 ? sizeof(struct icmp6_hdr) : sizeof(struct icmphdr))) {
     fprintf(stderr, "ICMP header malformed"
                     " (expected minimum size %ld, got %d)\n",
                     sizeof(struct icmphdr), icmp_len);
   }
   else {
-    if (recv_packet->icmp_header.type != ICMP_ECHOREPLY) {
+    if (header_id != ident) {
+      fprintf(stderr, "Echo ID incorrect"
+                      " (expected %d, got %d)\n", ident, header_id);
+    }
+    else if (header_type != (use_ipv6 ? ICMP6_ECHO_REPLY : ICMP_ECHOREPLY)) {
       fprintf(stderr, "%d bytes from %s icmp_seq = %d ",
               bytes_read, src_addr_name,
-              recv_packet->icmp_header.un.echo.sequence);
-      if (recv_packet->icmp_header.type == ICMP_TIME_EXCEEDED) {
+              header_seq);
+      if (header_type == (use_ipv6 ? ICMP6_TIME_EXCEEDED : ICMP_TIME_EXCEEDED)) {
         fprintf(stderr, "Time to live exceeded\n");
       }
       else {
         fprintf(stderr, "ICMP header type different than expected"
                         " (expected %d, got %d)\n",
-                        ICMP_ECHOREPLY, recv_packet->icmp_header.type);
+                        (use_ipv6 ? ICMP6_ECHO_REPLY : ICMP_ECHOREPLY), header_type);
       }
-    }
-    else if (recv_packet->icmp_header.un.echo.id != ident) {
-      fprintf(stderr, "Echo ID incorrect\n");
     }
     else {
       bool is_duplicate = false;
-      if (is_packet_received(recv_packet->icmp_header.un.echo.sequence)) {
+      if (is_packet_received(header_seq)) {
         is_duplicate = true;
       }
       else {
-        set_packet_state(recv_packet->icmp_header.un.echo.sequence, false);
+        set_packet_state(header_seq, false);
         g_packets_received++;
       }
 
-      int ttl = ip_header->ttl;
-
       long recv_micros = timespec_to_micros(recv_time);
-      long rtt = recv_micros - recv_packet->sent_micros;
+      long rtt = recv_micros - sent_micros;
       assert(rtt >= 0);
 
       if (!is_duplicate) {
@@ -329,13 +419,14 @@ int recv_ping(int socket_fd) {
         g_rtt_sum += rtt;
       }
 
-      printf("%d bytes from %s ", bytes_read, src_addr_name);
-
-      printf("icmp_seq=%d ttl=%d time=%ld.%03ld ms, loss=%.1f%%",
-             recv_packet->icmp_header.un.echo.sequence,
+      printf("%d bytes from %s "
+             "icmp_seq=%d ttl=%d time=%ld.%03ld ms loss=%.1f%%",
+             bytes_read,
+             src_addr_name,
+             header_seq,
              ttl,
              rtt / 1000, rtt % 1000,
-             100 * (float)(g_packets_sent - g_packets_received) / g_packets_sent);
+             (100.f * (g_packets_sent - g_packets_received)) / g_packets_sent);
 
       if (!check_in_cksum(data, bytes_read)) {
         printf(" - checksum error");
@@ -373,6 +464,7 @@ int main(int argc, char** argv) {
 
   signal(SIGINT, sigint_handler);
 
+  bool opt_use_ipv6 = false;
   int opt_custom_ttl = -1;
   int opt_sleep_duration = 1e6;
   int opt_ping_count = -1;
@@ -380,26 +472,26 @@ int main(int argc, char** argv) {
   char c = '\0';
   while ((c = getopt(argc, argv, "6t:c:i:")) != -1) {
     switch(c) {
-    case '6':
-      use_ipv6 = true;
-      break;
-    case 't':
-      opt_custom_ttl = atoi(optarg);
-      break;
-    case 'i':
-      opt_sleep_duration = 1e6 * atof(optarg);
-      break;
-    case 'c':
-     opt_ping_count = atoi(optarg);
-      break;
-    case '?':
-      if ((optopt == 't') || (optopt == 'i') || (optopt == 'c')) {
-        fprintf(stderr, "Option -%c requires an argument.\n", optopt);
+      case '6':
+        opt_use_ipv6 = true;
         break;
-      }
-    default:
-      print_help();
-      return EXIT_FAILURE;
+      case 't':
+        opt_custom_ttl = atoi(optarg);
+        break;
+      case 'i':
+        opt_sleep_duration = 1e6 * atof(optarg);
+        break;
+      case 'c':
+       opt_ping_count = atoi(optarg);
+        break;
+      case '?':
+        if ((optopt == 't') || (optopt == 'i') || (optopt == 'c')) {
+          fprintf(stderr, "Option -%c requires an argument.\n", optopt);
+          break;
+        }
+      default:
+        print_help();
+        return EXIT_FAILURE;
     }
   }
 
@@ -418,29 +510,31 @@ int main(int argc, char** argv) {
   // Walk addrinfo linked list until one connects
   char ip_addr_str[INET6_ADDRSTRLEN];
   int socket_fd = -2;
-  for (struct addrinfo* addr_ptr = address; addr_ptr != NULL;
-       addr_ptr = addr_ptr->ai_next) {
+  // addr_ptr will point to the target address
+  struct addrinfo* addr_ptr = address;
+  for (; addr_ptr != NULL; addr_ptr = addr_ptr->ai_next) {
     void* sin_addr = NULL;
 
     if (addr_ptr->ai_family == AF_INET) {
-      if (use_ipv6) {
+      if (opt_use_ipv6) {
         continue;
       }
       struct sockaddr_in* ipv4 = (struct sockaddr_in*)addr_ptr->ai_addr;
       sin_addr = &ipv4->sin_addr;
     }
     else {
-      if (!use_ipv6) {
+      if (!opt_use_ipv6) {
         continue;
       }
       struct sockaddr_in6* ipv6 = (struct sockaddr_in6*)addr_ptr->ai_addr;
       sin_addr = &ipv6->sin6_addr;
+
     }
 
     inet_ntop(addr_ptr->ai_family, sin_addr, ip_addr_str, sizeof(ip_addr_str));
 
     socket_fd = socket(addr_ptr->ai_family, SOCK_RAW,
-                       use_ipv6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
+                       opt_use_ipv6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
     if (socket_fd == -1) {
       continue;
     }
@@ -456,15 +550,50 @@ int main(int argc, char** argv) {
     }
     else {
       perror("socket() failure");
+
+      if (errno == EPERM) {
+        fprintf(stderr, "Are you running as root?\n");
+      }
     }
     return EXIT_FAILURE;
   }
 
-  if (opt_custom_ttl != -1) {
-    int status = setsockopt(socket_fd, IPPROTO_IP, IP_TTL,
-                            &opt_custom_ttl, sizeof(opt_custom_ttl));
+  {
+    // Set IP_RECVTTL to receive TTL information
+    // You cannot receive IPv6 headers through recvfrom, so
+    // we must use ancillary data.
+
+    // https://www.ietf.org/rfc/rfc3542.txt
+    int yes = 1;
+    int status = 0;
+
+    if (opt_use_ipv6) {
+      status = setsockopt(socket_fd, IPPROTO_IPV6, IPV6_RECVHOPLIMIT, &yes,
+                          sizeof(yes));
+    }
+    else {
+      status = setsockopt(socket_fd, IPPROTO_IP, IP_RECVTTL, &yes,
+                          sizeof(yes));
+    }
+
     if (status) {
-      perror("setsockopt() failure");
+      perror("setsockopt() failure (TTL retrieval)");
+    }
+  }
+
+  if (opt_custom_ttl != -1) {
+    int status = 0;
+    if (opt_use_ipv6) {
+      status = setsockopt(socket_fd, IPPROTO_IPV6, IPV6_UNICAST_HOPS,
+                          &opt_custom_ttl, sizeof(opt_custom_ttl));
+    }
+    else {
+      status = setsockopt(socket_fd, IPPROTO_IP, IP_TTL,
+                          &opt_custom_ttl, sizeof(opt_custom_ttl));
+    }
+
+    if (status) {
+      perror("setsockopt() failure (specifying TTL)");
     }
   }
 
@@ -505,7 +634,7 @@ int main(int argc, char** argv) {
       }
       else if (status) {
         if (FD_ISSET(socket_fd, &write_fds)) {
-          if (send_ping(socket_fd, address) == -1) {
+          if (send_ping(socket_fd, addr_ptr, opt_use_ipv6) == -1) {
             return EXIT_FAILURE;
           }
 
@@ -513,7 +642,7 @@ int main(int argc, char** argv) {
         }
         else {  // read should now be open
           assert(FD_ISSET(socket_fd, &read_fds));
-          if (recv_ping(socket_fd) == -1) {
+          if (recv_ping(socket_fd, opt_use_ipv6) == -1) {
             return EXIT_FAILURE;
           }
         }
