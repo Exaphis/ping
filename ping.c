@@ -43,16 +43,12 @@ static long g_min_rtt = LONG_MAX;
 static long g_max_rtt = 0;
 static unsigned long long g_rtt_sum = 0;
 static uint8_t g_received_packet[(MAX_ECHO_SEQUENCE / CHAR_BIT) + 1] = { 0 };
+static bool use_ipv6 = false;
 
 struct icmp_packet_t {
   struct icmphdr icmp_header;
   long sent_micros;
   uint8_t padding[PING_DATA_SIZE - sizeof(long)];
-};
-
-struct recv_icmp_packet_t {
-  struct iphdr ip_header;
-  struct icmp_packet_t icmp_packet;
 };
 
 /*
@@ -214,11 +210,7 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr) {
 
   icmp_packet.icmp_header.type = ICMP_ECHO;
   icmp_packet.icmp_header.un.echo.sequence = g_packets_sent++;
-  icmp_packet.icmp_header.un.echo.id = getpid();
-
-  icmp_packet.icmp_header.checksum = 0;
-  uint16_t checksum = gen_in_cksum(&icmp_packet, sizeof(icmp_packet));
-  icmp_packet.icmp_header.checksum = checksum;
+  icmp_packet.icmp_header.un.echo.id = (uint16_t)getpid();
 
   struct timespec sent_time = { 0 };
   if (clock_gettime(CLOCK_MONOTONIC, &sent_time) == -1) {
@@ -228,9 +220,14 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr) {
 
   set_packet_state(icmp_packet.icmp_header.un.echo.sequence, false);
 
+  icmp_packet.icmp_header.checksum = 0;
+  uint16_t checksum = gen_in_cksum(&icmp_packet, sizeof(icmp_packet));
+  icmp_packet.icmp_header.checksum = checksum;
+
+  assert(check_in_cksum(&icmp_packet, sizeof(icmp_packet)));
   int bytes_sent = sendto(socket_fd, &icmp_packet, sizeof(icmp_packet), 0,
                           dest_addr->ai_addr, dest_addr->ai_addrlen);
-  if (bytes_sent == -1) {
+  if ((bytes_sent == -1) || (bytes_sent != sizeof(icmp_packet))) {
     perror("sendto() failure");
   }
 
@@ -257,22 +254,55 @@ int recv_ping(int socket_fd) {
     perror("clock_gettime() failure");
   }
 
-  struct recv_icmp_packet_t* recv_data = (struct recv_icmp_packet_t*)data;
-  struct icmp_packet_t* recv_packet = &(recv_data->icmp_packet);
+  char src_addr_name[INET6_ADDRSTRLEN];
+  inet_ntop(src_addr.ss_family, get_in_addr((struct sockaddr*)&src_addr),
+            src_addr_name, sizeof(src_addr_name));
+
+  struct iphdr* ip_header = (struct iphdr*)data;
+
+  if (!use_ipv6 && (ip_header->protocol != IPPROTO_ICMP)) {
+    fprintf(stderr, "Protocol not ICMP\n");
+    return bytes_read;
+  }
+
+  // ihl contains the number of 32-bit words in the header
+  int ip_header_len = 0;
+  if (!use_ipv6) {
+    ip_header_len = ip_header->ihl * sizeof(uint32_t);
+  }
+
+  struct icmp_packet_t* recv_packet = (struct icmp_packet_t*)(data + ip_header_len);
+
+  // debug
+  printf("type: %d\ncode: %d\nid: %d\nsequence:%d\n", recv_packet->icmp_header.type, recv_packet->icmp_header.code, recv_packet->icmp_header.un.echo.id, recv_packet->icmp_header.un.echo.sequence);
+  // endbug
+
+  int icmp_len = bytes_read - ip_header_len;
 
   if (bytes_read == -1) {
     perror("recvfrom() failure");
   }
-  else if (bytes_read != sizeof(struct icmp_packet_t)) {
-    fprintf(stderr, "Packet length different than expected"
-                    " (expected %ld, got %d)\n",
-                    sizeof(struct icmp_packet_t), bytes_read);
+  else if (icmp_len < sizeof(struct icmphdr)) {
+    fprintf(stderr, "ICMP header malformed"
+                    " (expected minimum size %ld, got %d)\n",
+                    sizeof(struct icmphdr), icmp_len);
   }
   else {
     if (recv_packet->icmp_header.type != ICMP_ECHOREPLY) {
-      fprintf(stderr, "Packet type different than expected"
-                      " (expected %d, got %d)\n",
-                      ICMP_ECHOREPLY, recv_packet->icmp_header.type);
+      fprintf(stderr, "%d bytes from %s icmp_seq = %d ",
+              bytes_read, src_addr_name,
+              recv_packet->icmp_header.un.echo.sequence);
+      if (recv_packet->icmp_header.type == ICMP_TIME_EXCEEDED) {
+        fprintf(stderr, "Time to live exceeded\n");
+      }
+      else {
+        fprintf(stderr, "ICMP header type different than expected"
+                        " (expected %d, got %d)\n",
+                        ICMP_ECHOREPLY, recv_packet->icmp_header.type);
+      }
+    }
+    else if (recv_packet->icmp_header.un.echo.id != (uint16_t)getpid()) {
+      fprintf(stderr, "Echo ID incorrect\n");
     }
     else {
       bool is_duplicate = false;
@@ -284,7 +314,7 @@ int recv_ping(int socket_fd) {
         g_packets_received++;
       }
 
-      int ttl = recv_data->ip_header.ttl;
+      int ttl = ip_header->ttl;
 
       long recv_micros = timespec_to_micros(recv_time);
       long rtt = recv_micros - recv_packet->sent_micros;
@@ -297,17 +327,13 @@ int recv_ping(int socket_fd) {
         g_rtt_sum += rtt;
       }
 
-      char src_addr_name[INET6_ADDRSTRLEN];
-      printf("%d bytes from %s: icmp_seq=%d ttl=%d time=%ld.%03ld ms,"
-             "loss=%.1f%%\n",
-             bytes_read,
-             inet_ntop(src_addr.ss_family,
-                       get_in_addr((struct sockaddr*)&src_addr),
-                       src_addr_name, sizeof(src_addr_name)),
+      printf("%d bytes from %s ", bytes_read, src_addr_name);
+
+      printf("icmp_seq=%d ttl=%d time=%ld.%03ld ms, loss=%.1f%%",
              recv_packet->icmp_header.un.echo.sequence,
              ttl,
              rtt / 1000, rtt % 1000,
-             (float)(g_packets_sent - g_packets_received) / g_packets_sent);
+             100 * (float)(g_packets_sent - g_packets_received) / g_packets_sent);
 
       if (!check_in_cksum(data, bytes_read)) {
         printf(" - checksum error");
@@ -343,10 +369,9 @@ void print_help() {
 int main(int argc, char** argv) {
   signal(SIGINT, sigint_handler);
 
-  bool use_ipv6 = false;
-  int custom_ttl = -1;
-  float sleep_duration = 1;
-  int ping_count = -1;
+  int opt_custom_ttl = -1;
+  int opt_sleep_duration = 1e6;
+  int opt_ping_count = -1;
 
   char c = '\0';
   while ((c = getopt(argc, argv, "6t:c:i:")) != -1) {
@@ -355,13 +380,13 @@ int main(int argc, char** argv) {
       use_ipv6 = true;
       break;
     case 't':
-      custom_ttl = atoi(optarg);
+      opt_custom_ttl = atoi(optarg);
       break;
     case 'i':
-      sleep_duration = atof(optarg);
+      opt_sleep_duration = 1e6 * atof(optarg);
       break;
     case 'c':
-      ping_count = atoi(optarg);
+     opt_ping_count = atoi(optarg);
       break;
     case '?':
       if ((optopt == 't') || (optopt == 'i') || (optopt == 'c')) {
@@ -431,40 +456,90 @@ int main(int argc, char** argv) {
     return EXIT_FAILURE;
   }
 
-  if (custom_ttl != -1) {
-    // TODO: report time exceeded
+  if (opt_custom_ttl != -1) {
     int status = setsockopt(socket_fd, IPPROTO_IP, IP_TTL,
-                            &custom_ttl, sizeof(custom_ttl));
+                            &opt_custom_ttl, sizeof(opt_custom_ttl));
     if (status) {
       perror("setsockopt() failure");
     }
   }
 
-  // TODO: allow sending without receiving
-  while (!g_interrupt) {
-    if (send_ping(socket_fd, address) == -1) {
-      return EXIT_FAILURE;
+  struct timeval timeout_tv;
+  int ping_count = opt_ping_count;
+
+  while (!g_interrupt && ping_count) {
+    struct timespec start_time = { 0 };
+    if (clock_gettime(CLOCK_MONOTONIC, &start_time) == -1) {
+      perror("clock_gettime() failure");
     }
 
-    if (recv_ping(socket_fd) == -1) {
-      return EXIT_FAILURE;
-    }
+    // Send ping, then attempt to receive.
+    // If timeout is reached, skip and try again.
+    bool sent = false;
+    while (!g_interrupt &&
+          (!sent || (g_packets_received - g_packets_sent) != 0)) {
+      timeout_tv.tv_sec = opt_sleep_duration / 1e6;
+      timeout_tv.tv_usec = opt_sleep_duration % (int)1e6;
 
-    if (ping_count != -1) {
-      ping_count--;
+      fd_set read_fds;
+      fd_set write_fds;
 
-      if (ping_count == 0) {
+      FD_ZERO(&read_fds);
+      FD_ZERO(&write_fds);
+
+      FD_SET(socket_fd, &read_fds);
+
+      if (!sent) {
+        FD_SET(socket_fd, &write_fds);
+      }
+
+      int status = select(socket_fd + 1, &read_fds, &write_fds, NULL, &timeout_tv);
+      if (status == -1) {
+        if (errno != EINTR) {
+          perror("select() failure");
+        }
+      }
+      else if (status) {
+        if (FD_ISSET(socket_fd, &write_fds)) {
+          if (send_ping(socket_fd, address) == -1) {
+            return EXIT_FAILURE;
+          }
+
+          sent = true;
+        }
+        else {  // read should now be open
+          assert(FD_ISSET(socket_fd, &read_fds));
+          if (recv_ping(socket_fd) == -1) {
+            return EXIT_FAILURE;
+          }
+        }
+      }
+      else {
         break;
       }
     }
 
-    usleep(sleep_duration * 1000000);
+    if (ping_count != -1) {
+      ping_count--;
+    }
+
+    // Sleep for any remaining time left in the specified sleep duration
+    struct timespec end_time = { 0 };
+    if (clock_gettime(CLOCK_MONOTONIC, &end_time) == -1) {
+      perror("clock_gettime() failure");
+    }
+
+    long time_delta = timespec_to_micros(end_time) - timespec_to_micros(start_time);
+
+    if (ping_count && !g_interrupt && (time_delta < opt_sleep_duration)) {
+      usleep(opt_sleep_duration - time_delta);
+    }
   }
 
   printf("\n--- %s ping statistics ---\n", destination);
   printf("%d packets transmitted, %d packets received, %.1f%% packet loss\n",
          g_packets_sent, g_packets_received,
-         ((float)(g_packets_sent - g_packets_received)) / g_packets_sent);
+         100 * ((float)(g_packets_sent - g_packets_received)) / g_packets_sent);
 
   if (g_packets_received > 0) {
     unsigned long long g_avg_rtt = g_rtt_sum / g_packets_received;
