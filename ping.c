@@ -10,7 +10,9 @@
  *    - https://www.cs.utah.edu/~swalton/listings/sockets/programs/part4/
         chap18/ping.c
  *    - https://beej.us/guide/bgnet/html
- *    - https://tools.ietf.org/html/rfc2292
+ *    - https://tools.ietf.org/html/rfc792 - Internet Control Message Protocol
+ *    - https://tools.ietf.org/html/rfc3542 - Advanced Sockets Application
+ *      Program Interface (API) for IPv6
  */
 
 #include <assert.h>
@@ -49,14 +51,16 @@ static int ident = 0;  // Will be set to current PID, used for ICMP identifier
 
 struct icmp_packet_t {
   struct icmphdr icmp_header;
-  long sent_micros;
-  uint8_t padding[PING_DATA_SIZE - sizeof(long)];
+  long sent_secs;
+  long sent_nanos;
+  uint8_t padding[PING_DATA_SIZE - 2 * sizeof(long)];
 };
 
 struct icmp6_packet_t {
   struct icmp6_hdr icmp_header;
-  long sent_micros;
-  uint8_t padding[PING_DATA_SIZE - sizeof(long)];
+  long sent_secs;
+  long sent_nanos;
+  uint8_t padding[PING_DATA_SIZE - 2 * sizeof(long)];
 };
 
 /*
@@ -66,7 +70,7 @@ struct icmp6_packet_t {
  *  microseconds since time 0.
  */
 
-long timespec_to_micros(struct timespec ts) {
+long long timespec_to_micros(struct timespec ts) {
   return (ts.tv_sec * 1000000) + (ts.tv_nsec / 1000);
 } /* timespec_to_micros() */
 
@@ -93,7 +97,7 @@ void set_packet_state(int seq, bool state) {
     g_received_packet[idx] |= (1 << bit);
   }
   else {
-    g_received_packet[idx] &= ~(1 << bit);
+    g_received_packet[idx] &= (uint8_t)(~(1 << bit));
   }
 } /* set_packet_state() */
 
@@ -219,16 +223,17 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr, bool use_ipv6) {
 
     icmp_packet.icmp_header.type = ICMP_ECHO;
     icmp_packet.icmp_header.code = 0;
-    icmp_packet.icmp_header.un.echo.sequence = g_packets_sent++;
-    icmp_packet.icmp_header.un.echo.id = ident;
+    icmp_packet.icmp_header.un.echo.sequence = htons(g_packets_sent++);
+    icmp_packet.icmp_header.un.echo.id = htons(ident);
 
     struct timespec sent_time = { 0 };
     if (clock_gettime(CLOCK_MONOTONIC, &sent_time) == -1) {
       perror("clock_gettime() failure");
     }
-    icmp_packet.sent_micros = timespec_to_micros(sent_time);
+    icmp_packet.sent_secs = htonl((long)sent_time.tv_sec);
+    icmp_packet.sent_nanos = htonl(sent_time.tv_nsec);
 
-    set_packet_state(icmp_packet.icmp_header.un.echo.sequence, false);
+    set_packet_state(ntohs(icmp_packet.icmp_header.un.echo.sequence), false);
 
     icmp_packet.icmp_header.checksum = 0;
     uint16_t checksum = gen_in_cksum(&icmp_packet, sizeof(icmp_packet));
@@ -248,21 +253,20 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr, bool use_ipv6) {
 
     icmp_packet.icmp_header.icmp6_type = ICMP6_ECHO_REQUEST;
     icmp_packet.icmp_header.icmp6_code = 0;
-    icmp_packet.icmp_header.icmp6_seq = g_packets_sent++;
-    icmp_packet.icmp_header.icmp6_id = ident;
+    icmp_packet.icmp_header.icmp6_seq = htons(g_packets_sent++);
+    icmp_packet.icmp_header.icmp6_id = htons(ident);
 
     struct timespec sent_time = { 0 };
     if (clock_gettime(CLOCK_MONOTONIC, &sent_time) == -1) {
       perror("clock_gettime() failure");
     }
-    icmp_packet.sent_micros = timespec_to_micros(sent_time);
+    icmp_packet.sent_secs = htonl((long)sent_time.tv_sec);
+    icmp_packet.sent_nanos = htonl(sent_time.tv_nsec);
 
-    set_packet_state(icmp_packet.icmp_header.icmp6_seq, false);
+    set_packet_state(ntohs(icmp_packet.icmp_header.icmp6_seq), false);
 
     // Checksums are automatically computed for ICMPv6 packets
     icmp_packet.icmp_header.icmp6_cksum = 0;
-    uint16_t checksum = gen_in_cksum(&icmp_packet, sizeof(icmp_packet));
-    icmp_packet.icmp_header.icmp6_cksum = checksum;
 
     int bytes_sent = sendto(socket_fd, &icmp_packet, sizeof(icmp_packet), 0,
                             dest_addr->ai_addr, dest_addr->ai_addrlen);
@@ -303,7 +307,6 @@ int recv_ping(int socket_fd, bool use_ipv6) {
   struct timespec recv_time = { 0 };
 
   int bytes_read = recvmsg(socket_fd, &hdr, 0);
-
   if (clock_gettime(CLOCK_MONOTONIC, &recv_time) == -1) {
     perror("clock_gettime() failure");
   }
@@ -344,30 +347,53 @@ int recv_ping(int socket_fd, bool use_ipv6) {
   }
 
   uint8_t header_type = 0;
-  //uint8_t header_code = 0;
+  uint8_t header_code = 0;
   uint16_t header_seq = 0;
   uint16_t header_id = 0;
-  long sent_micros = 0;
+  long long sent_micros = 0;
+  bool checksum_correct = false;
 
   if (!use_ipv6) {
     struct icmp_packet_t* recv_packet = (struct icmp_packet_t*)(data + ip_header_len);
     header_type = recv_packet->icmp_header.type;
-    //header_code = recv_packet->icmp_header.code;
-    header_seq = recv_packet->icmp_header.un.echo.sequence;
-    header_id = recv_packet->icmp_header.un.echo.id;
-    sent_micros = recv_packet->sent_micros;
+    header_code = recv_packet->icmp_header.code;
+    header_seq = ntohs(recv_packet->icmp_header.un.echo.sequence);
+    header_id = ntohs(recv_packet->icmp_header.un.echo.id);
+
+    struct timespec sent_time = { 0 };
+    sent_time.tv_sec = (time_t)ntohl(recv_packet->sent_secs);
+    sent_time.tv_nsec = ntohl(recv_packet->sent_nanos);
+    sent_micros = timespec_to_micros(sent_time);
+
+    checksum_correct = check_in_cksum(data, bytes_read);
   }
   else {
     struct icmp6_packet_t* recv_packet = (struct icmp6_packet_t*)(data + ip_header_len);
     header_type = recv_packet->icmp_header.icmp6_type;
-    //header_code = recv_packet->icmp_header.icmp6_code;
-    header_seq = recv_packet->icmp_header.icmp6_seq;
-    header_id = recv_packet->icmp_header.icmp6_id;
-    sent_micros = recv_packet->sent_micros;
+    header_code = recv_packet->icmp_header.icmp6_code;
+    header_seq = ntohs(recv_packet->icmp_header.icmp6_seq);
+    header_id = ntohs(recv_packet->icmp_header.icmp6_id);
+
+    struct timespec sent_time = { 0 };
+    sent_time.tv_sec = (time_t)ntohl(recv_packet->sent_secs);
+    sent_time.tv_nsec = ntohl(recv_packet->sent_nanos);
+    sent_micros = timespec_to_micros(sent_time);
+
+    // Verifying checksums for IPv6 ping packets are out of the scope of
+    // this project.
+    // To calculate the checksum, one must construct a pseudo-header,
+    // which contains the source address. That means we have to select
+    // the source address ourselves.
+    // RFC 3542 describes the new IPV6_CHECKSUM socket option that will
+    // automatically drop packets with an incorrect checksum, but it cannot
+    // be set for ICMPv6 sockets.
+    checksum_correct = true;
   }
 
   // debug
   //printf("type: %d\ncode: %d\nid: %d\nsequence:%d\nttl:%d\n", header_type, header_code, header_id, header_seq, ttl);
+  //printf("micros: %llX\n", sent_micros);
+  //printf("%d\n", is_packet_received(0));
   // endbug
 
   int icmp_len = bytes_read - ip_header_len;
@@ -381,9 +407,13 @@ int recv_ping(int socket_fd, bool use_ipv6) {
                     sizeof(struct icmphdr), icmp_len);
   }
   else {
-    if (header_id != ident) {
-      fprintf(stderr, "Echo ID incorrect"
-                      " (expected %d, got %d)\n", ident, header_id);
+    // Identifier might be zero if header_code=0 (RFC 792 Page 14)
+    if (((header_code != 0) && (header_id != ident)) ||
+        ((header_code == 0) && (header_id != 0) && (header_id != ident))) {
+      // Can safely ignore, will occur when multiple ping programs are
+      // active at the same time
+      // fprintf(stderr, "Echo ID incorrect"
+      //                " (expected %d, got %d)\n", ident, header_id);
     }
     else if (header_type != (use_ipv6 ? ICMP6_ECHO_REPLY : ICMP_ECHOREPLY)) {
       fprintf(stderr, "%d bytes from %s icmp_seq = %d ",
@@ -404,11 +434,11 @@ int recv_ping(int socket_fd, bool use_ipv6) {
         is_duplicate = true;
       }
       else {
-        set_packet_state(header_seq, false);
+        set_packet_state(header_seq, true);
         g_packets_received++;
       }
 
-      long recv_micros = timespec_to_micros(recv_time);
+      long long recv_micros = timespec_to_micros(recv_time);
       long rtt = recv_micros - sent_micros;
       assert(rtt >= 0);
 
@@ -428,7 +458,7 @@ int recv_ping(int socket_fd, bool use_ipv6) {
              rtt / 1000, rtt % 1000,
              (100.f * (g_packets_sent - g_packets_received)) / g_packets_sent);
 
-      if (!check_in_cksum(data, bytes_read)) {
+      if (!checksum_correct) {
         printf(" - checksum error");
       }
       if (is_duplicate) {
@@ -452,7 +482,7 @@ void print_help() {
   fprintf(stderr, "-6           Use IPv6 instead of IPv4\n");
   fprintf(stderr, "-c count     Stop after sending count ECHO_REQUEST packets\n");
   fprintf(stderr, "-t ttl       Set the IP Time to Live\n");
-  fprintf(stderr, "-i interval  Wait <interval> seconds between sending each packet.\n");
+  fprintf(stderr, "-i interval  Wait <interval> seconds between sending each packet\n");
 } /* print_help() */
 
 /*
