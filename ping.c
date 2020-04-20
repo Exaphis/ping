@@ -44,6 +44,7 @@ static long g_max_rtt = 0;
 static unsigned long long g_rtt_sum = 0;
 static uint8_t g_received_packet[(MAX_ECHO_SEQUENCE / CHAR_BIT) + 1] = { 0 };
 static bool use_ipv6 = false;
+static int ident = 0;  // Will be set to current PID, used for ICMP identifier
 
 struct icmp_packet_t {
   struct icmphdr icmp_header;
@@ -52,7 +53,7 @@ struct icmp_packet_t {
 };
 
 /*
- *  timesepc_to_micros converts a struct timespec
+ *  timespec_to_micros converts a struct timespec
  *  (seconds, nanoseconds) representation of time
  *  to a single long representing the number of
  *  microseconds since time 0.
@@ -209,8 +210,9 @@ int send_ping(int socket_fd, struct addrinfo* dest_addr) {
   struct icmp_packet_t icmp_packet = { 0 };
 
   icmp_packet.icmp_header.type = ICMP_ECHO;
+  icmp_packet.icmp_header.code = 0;
   icmp_packet.icmp_header.un.echo.sequence = g_packets_sent++;
-  icmp_packet.icmp_header.un.echo.id = (uint16_t)getpid();
+  icmp_packet.icmp_header.un.echo.id = ident;
 
   struct timespec sent_time = { 0 };
   if (clock_gettime(CLOCK_MONOTONIC, &sent_time) == -1) {
@@ -301,7 +303,7 @@ int recv_ping(int socket_fd) {
                         ICMP_ECHOREPLY, recv_packet->icmp_header.type);
       }
     }
-    else if (recv_packet->icmp_header.un.echo.id != (uint16_t)getpid()) {
+    else if (recv_packet->icmp_header.un.echo.id != ident) {
       fprintf(stderr, "Echo ID incorrect\n");
     }
     else {
@@ -367,6 +369,8 @@ void print_help() {
  */
 
 int main(int argc, char** argv) {
+  ident = getpid();
+
   signal(SIGINT, sigint_handler);
 
   int opt_custom_ttl = -1;
